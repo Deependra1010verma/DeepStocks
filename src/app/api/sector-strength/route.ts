@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { fetchHistoricalCandles } from "@/lib/dataFetcher";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 // Pick one representative stock per sector to gauge sector performance
 const SECTOR_REPRESENTATIVES: Record<string, string> = {

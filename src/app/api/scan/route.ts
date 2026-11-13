@@ -4,7 +4,7 @@ import { batchFetchStockData } from "@/lib/dataFetcher";
 import { runScreener, ScreenerMode } from "@/lib/screenerEngine";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {

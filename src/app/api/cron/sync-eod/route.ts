@@ -7,9 +7,10 @@ import { connectDB } from "@/lib/db";
 import { getMarketSession, isAutomationWindow, todayIST } from "@/lib/timezone";
 import { SignalLedger } from "@/lib/models/SignalLedger";
 import { Watchlist } from "@/lib/models/Watchlist";
+import { getAppUrl } from "@/lib/appUrl";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 // Security: only allow cron calls with secret header
 // Call this route via: GET /api/cron/sync-eod?secret=YOUR_CRON_SECRET
@@ -17,10 +18,13 @@ export const maxDuration = 300;
 
 export async function GET(req: NextRequest) {
   const secret = req.nextUrl.searchParams.get("secret");
-  const cronSecret = process.env.CRON_SECRET ?? "deepstocks-cron";
+  const cronSecret = process.env.CRON_SECRET;
   const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
 
-  if (secret !== cronSecret && bearer !== cronSecret) {
+  const isAuthorized = Boolean(cronSecret) && (
+    bearer === cronSecret || (process.env.NODE_ENV !== "production" && secret === cronSecret)
+  );
+  if (!isAuthorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -58,7 +62,7 @@ export async function GET(req: NextRequest) {
     // 2. Fetch market regime
     let marketRegime: "BULLISH" | "NEUTRAL" | "BEARISH" = "NEUTRAL";
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
+      const baseUrl = getAppUrl();
       const moodRes = await fetch(`${baseUrl}/api/market-mood`);
       const moodData = await moodRes.json();
       marketRegime = moodData.regime ?? "NEUTRAL";

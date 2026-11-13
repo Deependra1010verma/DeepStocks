@@ -1,5 +1,6 @@
 // Telegram Bot Alert Integration for DeepStocks
 // Sends auto-scan results at scheduled times (9:25 AM Intraday, 3:00 PM BTST)
+import { getAppUrl } from "./appUrl";
 
 export interface TelegramAlertPayload {
   mode: string;
@@ -70,7 +71,7 @@ function buildAlertMessage(payload: TelegramAlertPayload): string {
   });
 
   msg += `━━━━━━━━━━━━━━━━━━\n`;
-  msg += `🔗 [Open DeepStocks Dashboard](${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"})`;
+  msg += `🔗 [Open DeepStocks Dashboard](${getAppUrl()})`;
 
   return msg;
 }

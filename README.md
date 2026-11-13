@@ -16,6 +16,20 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## DeepStocks runtime features
+
+- The scanner uses a curated 250-ish NSE discovery universe, 20-way resilient batching, daily/15-minute candles, weekly confirmation, RVOL, sector-relative scoring, and an extension filter.
+- Gemini analysis is guarded by the screener state: near misses, low RVOL, extended moves, bearish weekly trend, and missing fundamentals cannot be upgraded to a high-conviction buy by the model.
+- `GEMINI_API_KEY_1` through `GEMINI_API_KEY_9` are rotated on quota/auth failures. Keep them server-side in `.env.local`; do not commit the file.
+- Watchlist and signal ledger APIs require MongoDB: `POST /api/watchlist`, `GET /api/ledger`.
+- Telegram automation is protected by `CRON_SECRET` and runs through `/api/cron/sync-eod`; `vercel.json` schedules it every 20 minutes and the route skips non-live NSE sessions.
+
+For a local cron smoke test:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/sync-eod
+```
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.

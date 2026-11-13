@@ -1,0 +1,50 @@
+# Cline context exclusions
+# Keep generated, dependency, cache, and secret files out of automatic context.
+
+# Dependencies and package-manager artifacts
+node_modules/
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# Build and generated output
+dist/
+build/
+out/
+target/
+coverage/
+.next/
+.nuxt/
+.svelte-kit/
+.angular/
+.cache/
+.parcel-cache/
+.turbo/
+.vite/
+*.tsbuildinfo
+*.map
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+temp/
+.tmp/
+
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# VCS and local editor metadata
+.git/
+.svn/
+.hg/
+.DS_Store
+.vscode/
+.idea/

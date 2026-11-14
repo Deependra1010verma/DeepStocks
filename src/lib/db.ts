@@ -8,7 +8,7 @@ declare global {
 
 export async function connectDB() {
   if (!process.env.MONGODB_URI && process.env.NODE_ENV === "production") {
-    throw new Error("MONGODB_URI is required in the Vercel environment");
+    throw new Error("MONGODB_URI is required in the deployed environment");
   }
   if (global._mongooseConn && mongoose.connection.readyState === 1) {
     return global._mongooseConn;

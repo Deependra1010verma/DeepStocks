@@ -1,39 +1,24 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
-const ai = new GoogleGenAI({
-  apiKey: "AIzaSyDWePP3skdRIP2sLUDlXiIlVx_U6bRjvC0",
-  httpOptions: { apiVersion: "v1beta" },
-});
+const apiKey = process.env.GEMINI_API_KEY ?? process.env.GEMINI_API_KEY_1;
+if (!apiKey) throw new Error("Set GEMINI_API_KEY or GEMINI_API_KEY_1 before running this script");
 
+const ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: "v1beta" } });
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
     convictionScore: { type: Type.NUMBER },
-    verdictBadge: { type: Type.STRING, enum: ["STRONG BUY SETUP","BUY ON DIP","WATCHLIST ONLY","AVOID - HIGH RISK"] },
+    verdictBadge: { type: Type.STRING },
     executiveSummary: { type: Type.STRING },
-    tradePlan: {
-      type: Type.OBJECT,
-      properties: {
-        entryZone: { type: Type.STRING }, stopLoss: { type: Type.STRING },
-        stopLossReason: { type: Type.STRING }, target1: { type: Type.STRING },
-        target2: { type: Type.STRING }, riskRewardRatio: { type: Type.STRING },
-        holdingPeriod: { type: Type.STRING },
-      },
-      required: ["entryZone","stopLoss","stopLossReason","target1","target2","riskRewardRatio","holdingPeriod"],
-    },
-    technicalBreakdown: { type: Type.ARRAY, items: { type: Type.STRING } },
-    fundamentalCheck: { type: Type.ARRAY, items: { type: Type.STRING } },
-    newsAndCatalysts: { type: Type.ARRAY, items: { type: Type.STRING } },
-    keyRisksAndTraps: { type: Type.ARRAY, items: { type: Type.STRING } },
   },
-  required: ["convictionScore","verdictBadge","executiveSummary","tradePlan","technicalBreakdown","fundamentalCheck","newsAndCatalysts","keyRisksAndTraps"],
+  required: ["convictionScore", "verdictBadge", "executiveSummary"],
 };
 
-console.log("Testing v1beta with systemInstruction + responseSchema...");
+console.log("Testing v1beta with responseSchema...");
 try {
-  const r = await ai.models.generateContent({
+  const response = await ai.models.generateContent({
     model: "gemini-2.5-flash",
-    contents: [{ role: "user", parts: [{ text: '{"symbol":"BLUESTARCO","cmp":1800,"rsi":62,"ema20":1780,"ema50":1750}' }] }],
+    contents: [{ role: "user", parts: [{ text: '{"symbol":"BLUESTARCO","cmp":1800}' }] }],
     config: {
       systemInstruction: "You are an NSE stock analyst. Analyze the stock and return JSON.",
       responseMimeType: "application/json",
@@ -41,11 +26,7 @@ try {
       temperature: 0.3,
     },
   });
-  const parsed = JSON.parse(r.text ?? "{}");
-  console.log("✅ SUCCESS!");
-  console.log("  Verdict:", parsed.verdictBadge);
-  console.log("  Score:", parsed.convictionScore);
-  console.log("  Summary:", parsed.executiveSummary?.slice(0, 80));
+  console.log("✅ v1beta works. Response length:", response.text?.length ?? 0);
 } catch (e) {
-  console.error("❌ FAILED:", e.message);
+  console.error("❌ v1beta failed:", e.message ?? e);
 }

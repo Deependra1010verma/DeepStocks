@@ -12,18 +12,14 @@ import { getAppUrl } from "@/lib/appUrl";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-// Security: only allow cron calls with secret header
-// Call this route via: GET /api/cron/sync-eod?secret=YOUR_CRON_SECRET
-// Or set up a Vercel Cron Job / external cron service
+// Security: only allow external scheduler calls with an Authorization header.
+// Send: Authorization: Bearer YOUR_CRON_SECRET
 
 export async function GET(req: NextRequest) {
-  const secret = req.nextUrl.searchParams.get("secret");
   const cronSecret = process.env.CRON_SECRET;
   const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
 
-  const isAuthorized = Boolean(cronSecret) && (
-    bearer === cronSecret || (process.env.NODE_ENV !== "production" && secret === cronSecret)
-  );
+  const isAuthorized = Boolean(cronSecret) && bearer === cronSecret;
   if (!isAuthorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

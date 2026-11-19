@@ -5,7 +5,7 @@ import { connectDB } from "@/lib/db";
 import { ScanSnapshot, type IScanSnapshot, type RemovedScanStock } from "@/lib/models/ScanSnapshot";
 import { calendarDay, dateToISTString, todayIST, nextMarketOpen, getMarketSession, cashSessionLimits, sessionTime } from "@/lib/timezone";
 import { getMarketRegime } from "@/lib/marketRegime";
-import { applyInstitutionalGuards, marketEntryReasons, rankSectorCandidates } from "@/lib/riskGuards";
+import { applyInstitutionalGuards, rankSectorCandidates } from "@/lib/riskGuards";
 import { recheckDataQuality } from './dataQuality';
 import { withLease, recordOperation, AppError } from './operations';
 import { beforeDeadline, assertTimeRemaining, DeadlineError } from './deadline';
@@ -17,7 +17,7 @@ import { getNseEventReports } from './nseCorporateEvents';
 import { getNseSurveillanceReports } from './nseSurveillance';
 import { getNsePriceBands } from './nsePriceBands';
 import { referenceEntryReasons } from './entryClearance';
-import { qualifiesForShortlist as qualifies } from './strategyPolicy';
+import { marketEntryReasons, qualifiesForShortlist as qualifies } from './strategyPolicy';
 export const SCAN_VERSION = '2026-11-scan-v16';
 
 const FAST_REFRESH_MODES: ScreenerMode[] = ["intraday", "btst", "swing_breakout", "swing_pullback"];
@@ -40,6 +40,7 @@ export interface ScanResult {
   stocks: ScreenedStock[];
   removedToday: RemovedScanStock[];
   generatedAt: Date;
+  updatedAt?: Date;
   expiresAt: Date;
   cached: boolean;
 }
@@ -244,7 +245,7 @@ async function runLiveScan(
 
 async function saveSnapshot(
   mode: ScreenerMode, previous: IScanSnapshot | null, result: ScanResult, deadline: number, signal: AbortSignal
-): Promise<void> {
+): Promise<Date> {
   const identity = { mode, sector: 'All' };
   const updatedAt = new Date(Math.max(Date.now(), +(previous?.updatedAt ?? 0) + 1));
   try {
@@ -281,6 +282,7 @@ async function saveSnapshot(
     if (!confirmed)
       throw new AppError('SNAPSHOT_WRITE_UNCONFIRMED', 'Could not confirm the snapshot save. The next refresh checks saved progress.', 503, 15);
   }
+  return updatedAt;
 }
 
 async function readSnapshot(mode: ScreenerMode, timing?: SnapshotReadTiming): Promise<IScanSnapshot | null> {
@@ -339,6 +341,7 @@ export async function getCachedScan(mode: ScreenerMode, sector: string, getTimin
       message: snapshot.message,
       removedToday: snapshot.removedToday.filter(s=>dateToISTString(new Date(s.removedAt))===today&&inSector(s)),
       generatedAt: new Date(snapshot.generatedAt),
+      updatedAt: snapshot.updatedAt,
       expiresAt: incompatible ? new Date(0) : new Date(snapshot.expiresAt),
       cached: true,
     };
@@ -378,13 +381,13 @@ export async function refreshScan(mode: ScreenerMode, sector: string, requestDea
       assertTimeRemaining(deadline - 3500, controller.signal);
       trace.stage = 'snapshot-write';
       const writeStarted = Date.now();
-      await saveSnapshot(mode, previous, result, deadline, controller.signal);
+      const updatedAt = await saveSnapshot(mode, previous, result, deadline, controller.signal);
       trace.stages.writeMs = Date.now() - writeStarted;
       await beforeDeadline(() => recordOperation(`scan:${mode}`, {
         status: result.status, stage: 'complete', code: null, coverage: result.coverage,
         stages: trace.stages, latencyMs: Date.now() - startedAt
       }), Math.min(deadline, Date.now() + 600), controller.signal).catch(() => undefined);
-      return result;
+      return { ...result, updatedAt };
     }, 60000), deadline, controller.signal).catch(async error => {
       if (error instanceof AppError && error.status === 409) throw error;
       const failure = error instanceof AppError ? error

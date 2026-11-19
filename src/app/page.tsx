@@ -18,7 +18,7 @@ import OperationsStatus from '@/components/OperationsStatus';
 import { guardFingerprint, priceMovedBeyondCache, ANALYSIS_VERSION } from '@/lib/aiCachePolicy';
 import { getTradePlan } from '@/lib/tradePlan';
 import { referenceEntryReasons } from '@/lib/entryClearance';
-import { qualifiesForShortlist } from '@/lib/strategyPolicy';
+import { marketEntryReasons, qualifiesForShortlist } from '@/lib/strategyPolicy';
 import { recheckDataQuality } from '@/lib/dataQuality';
 import { clientProviderVersion, clientAIConfigured } from '@/lib/clientProvider';
 import { beforeDeadline } from '@/lib/deadline';
@@ -46,6 +46,7 @@ interface MarketMood {
   indiaVix?: string | null;
   defensiveMode?: boolean;
   riskMultiplier?: number;
+  positionRiskPercent?: number;
   regimeReason?: string | null;
   message: string | null;
   session?: {
@@ -71,9 +72,33 @@ interface ScanPayload {
   stocks?: ScreenedStock[];
   removedToday?: RemovedScanStock[];
   generatedAt?: string;
+  updatedAt?: string;
   expiresAt?: string;
   stale?: boolean;
   cached?: boolean;
+}
+
+interface ScanPermission {
+  revision: number;
+  nearMiss: boolean;
+  riskPercent: number;
+  reasons: string[];
+}
+
+function permissionKey(mode: ScreenerMode, symbol: string) {
+  return `${mode}:${symbol}`;
+}
+
+function withScanPermission(stock: ScreenedStock, permission?: ScanPermission): ScreenedStock {
+  if (!permission) return stock;
+  const riskPercent = stock.positionRiskPercent ?? 0;
+  if (!permission.nearMiss && permission.riskPercent >= riskPercent) return stock;
+  return {
+    ...stock,
+    nearMiss: Boolean(stock.nearMiss || permission.nearMiss),
+    positionRiskPercent: Math.min(riskPercent, permission.riskPercent),
+    guardReasons: [...new Set([...(stock.guardReasons ?? []), ...permission.reasons])]
+  };
 }
 
 interface LedgerInsights {
@@ -115,6 +140,21 @@ function browserCacheKey(stock: ScreenedStock, regime: string) {
 
 function evidenceTime(stock: ScreenedStock) {
   return Date.parse(stock.dataQuality?.fetchedAt ?? '') || 0;
+}
+
+function withMarketPermission(stock: ScreenedStock, market: MarketMood | null): ScreenedStock {
+  if (!market || stock.mode === 'longterm') return stock;
+  const reasons = marketEntryReasons(stock.mode, stock.rvol, market);
+  if (reasons.length) return {
+    ...stock,
+    nearMiss: true,
+    positionRiskPercent: 0,
+    guardReasons: [...new Set([...(stock.guardReasons ?? []), ...reasons])]
+  };
+  const cap = market.positionRiskPercent;
+  return cap !== undefined && cap < (stock.positionRiskPercent ?? 0)
+    ? { ...stock, positionRiskPercent: cap }
+    : stock;
 }
 
 function isOlderStock(incoming: ScreenedStock, current: ScreenedStock) {
@@ -213,6 +253,9 @@ function Dashboard() {
   const [snapshotLoaded, setSnapshotLoaded] = useState(false);
   const snapshotShown = useRef(false);
   const snapshotStamp = useRef<string | undefined>(undefined);
+  const scanRequestOrder = useRef(0);
+  const appliedSnapshots = useRef(new Map<ScreenerMode, { revision: number; requestOrder: number }>());
+  const [scanPermissions, setScanPermissions] = useState(() => new Map<string, ScanPermission>());
   const refreshControllers = useRef(new Map<string, AbortController>());
   const refreshCooldown = useRef(new Map<string, number>());
   const [coverage, setCoverage] = useState<ScanPayload['coverage']>();
@@ -292,32 +335,73 @@ function Dashboard() {
     })();
   }, []);
 
-  const applyScanPayload = useCallback((data: ScanPayload) => {
-    if (!Array.isArray(data.stocks)) return;
-    setStocks(data.stocks);
+  const applyScanPayload = useCallback((data: ScanPayload, mode: ScreenerMode, requestOrder: number) => {
+    if (!Array.isArray(data.stocks)) return false;
+    const cards = data.stocks;
+    const removed = Array.isArray(data.removedToday) ? data.removedToday : [];
+    const revision = Date.parse(data.updatedAt ?? data.generatedAt ?? '') || 0;
+    const previous = appliedSnapshots.current.get(mode);
+    const newerRevision = !previous || revision > previous.revision;
+    if (previous && (revision < previous.revision ||
+        (!newerRevision && requestOrder < previous.requestOrder))) return false;
+    appliedSnapshots.current.set(mode, { revision, requestOrder });
+    // A partial or sector-filtered scan only speaks for the symbols it includes.
+    if (cards.length || removed.length) setScanPermissions(previousPermissions => {
+      const permissions = new Map(previousPermissions);
+      const update = (symbol: string, nearMiss: boolean, riskPercent: number, reasons: string[]) => {
+        const key = permissionKey(mode, symbol);
+        const existing = permissions.get(key);
+        // A cached read can tighten an existing revision as its evidence expires.
+        // Only a newer revision can lift a restriction.
+        if (existing?.revision === revision) {
+          permissions.set(key, {
+            revision,
+            nearMiss: existing.nearMiss || nearMiss,
+            riskPercent: Math.min(existing.riskPercent, riskPercent),
+            reasons: [...new Set([...existing.reasons, ...reasons])]
+          });
+        } else {
+          permissions.set(key, { revision, nearMiss, riskPercent, reasons });
+        }
+      };
+      for (const card of cards) {
+        if (card.mode === mode) update(card.symbol, Boolean(card.nearMiss), card.nearMiss ? 0 : (card.positionRiskPercent ?? 0), card.guardReasons ?? []);
+      }
+      for (const item of removed) update(item.symbol, true, 0, [item.reason]);
+      return permissions;
+    });
+    setStocks(cards);
     const current = selectedStockRef.current;
-    const updated = current && data.stocks.find(stock => stock.symbol === current.symbol && stock.mode === current.mode);
-    if (current && updated && evidenceTime(updated) > evidenceTime(current) &&
-        (guardFingerprint(updated) !== guardFingerprint(current) || priceMovedBeyondCache(current.mode, current.cmp, updated.cmp))) {
-      const sameCandles = updated.dataQuality?.candleAt &&
-        updated.dataQuality.candleAt === current.dataQuality?.candleAt &&
-        updated.dataQuality.candleSource === current.dataQuality?.candleSource;
-      showStock({ ...updated, candles: updated.candles.length || !sameCandles ? updated.candles : current.candles });
-      setPaperSaved(false);
-      setAnalysis(null);
-      setAnalysisMeta(null);
-      setAnalysisError({ message: 'Setup updated. Refresh the explanation using current data.' });
+    const updated = current && cards.find(stock => stock.symbol === current.symbol && stock.mode === current.mode);
+    if (current && updated) {
+      const evidenceDelta = evidenceTime(updated) - evidenceTime(current);
+      const setupChanged = guardFingerprint(updated) !== guardFingerprint(current) ||
+        priceMovedBeyondCache(current.mode, current.cmp, updated.cmp);
+      if (setupChanged && (evidenceDelta > 0 || (evidenceDelta === 0 && newerRevision))) {
+        const sameCandles = updated.dataQuality?.candleAt &&
+          updated.dataQuality.candleAt === current.dataQuality?.candleAt &&
+          updated.dataQuality.candleSource === current.dataQuality?.candleSource;
+        showStock({ ...updated, candles: updated.candles.length || !sameCandles ? updated.candles : current.candles });
+        ++analysisRequestId.current;
+        setChartLoading(false);
+        setAnalysisLoading(false);
+        setPaperSaved(false);
+        setAnalysis(null);
+        setAnalysisMeta(null);
+        setAnalysisError({ message: 'Setup updated. Refresh the explanation using current data.' });
+      }
     }
     setCoverage(data.coverage);
     setSnapshotLoaded(true); snapshotShown.current = true;
     const isNewSnapshot = Boolean(data.generatedAt && data.generatedAt !== snapshotStamp.current);
     snapshotStamp.current = data.generatedAt;
     setScanStatus(data.status);
-    setRemovedToday(Array.isArray(data.removedToday) ? data.removedToday : []);
+    setRemovedToday(removed);
     if (data.generatedAt && data.expiresAt) {
       setSnapshotMeta({ generatedAt: data.generatedAt, expiresAt: data.expiresAt, cached: Boolean(data.cached) });
     }
     if (isNewSnapshot) prefetchTopAnalyses(data.stocks);
+    return true;
   }, [prefetchTopAnalyses, showStock]);
 
   const refreshInBackground = useCallback(async () => {
@@ -325,6 +409,7 @@ function Dashboard() {
     const refreshKey = `${selectedMode}:${selectedSector}`;
     if (refreshInFlight.current.has(refreshKey)) return;
     if (Date.now() < (refreshCooldown.current.get(refreshKey) ?? 0)) return;
+    const requestOrder = ++scanRequestOrder.current;
     const controller = new AbortController();
     refreshControllers.current.set(refreshKey, controller);
     refreshInFlight.current.add(refreshKey);
@@ -338,7 +423,7 @@ function Dashboard() {
       if (generation !== scanGeneration.current) return;
       const { response, data } = res;
       if (response.ok) {
-        applyScanPayload(data);
+        if (!applyScanPayload(data, selectedMode, requestOrder)) return;
         setScanNotice(data.message ?? null);
         if (data.expiresAt) refreshCooldown.current.set(refreshKey, Date.parse(data.expiresAt));
       } else {
@@ -366,6 +451,7 @@ function Dashboard() {
     const generation = scanGeneration.current;
     const snapshotKey = `${generation}:${selectedMode}:${selectedSector}`;
     if (snapshotInFlight.current.has(snapshotKey)) return;
+    const requestOrder = ++scanRequestOrder.current;
     snapshotInFlight.current.add(snapshotKey);
     setScanLoading(!snapshotShown.current);
     try {
@@ -373,7 +459,7 @@ function Dashboard() {
       if (generation !== scanGeneration.current) return;
       setSnapshotError(null);
       const changed = Boolean(data.generatedAt && data.generatedAt !== snapshotStamp.current);
-      applyScanPayload(data);
+      if (!applyScanPayload(data, selectedMode, requestOrder)) return;
       if (data.message) setScanNotice(data.message);
       if (changed && !data.stale && !refreshInFlight.current.has(`${selectedMode}:${selectedSector}`)) {
         setScanError(null); setScanNotice(data.message ?? null);
@@ -539,6 +625,7 @@ function Dashboard() {
     event.preventDefault();
     if (!searchQuery.trim()) return;
     const generation=++searchGeneration.current;
+    const detailRequest = analysisRequestId.current;
     setSearchLoading(true);
     setSearchError(null);
     try {
@@ -547,11 +634,17 @@ function Dashboard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbol: searchQuery, mode: selectedMode }),
       });
-      const data = await res.json();
+      const data: {stock?: ScreenedStock; error?: string} = await res.json();
       if (!res.ok || !data.stock) throw new Error(data.error ?? "Stock lookup failed");
       if(generation!==searchGeneration.current)return;
-      setStocks((current) => [data.stock, ...current.filter((item) => item.symbol !== data.stock.symbol)]);
-      await handleSelectStock(data.stock);
+      const stock = data.stock;
+      const current = selectedStockRef.current;
+      if (current && current.symbol === stock.symbol && current.mode === stock.mode &&
+          (detailRequest !== analysisRequestId.current || isOlderStock(stock, current))) {
+        throw new Error('Setup updated. Search again using current data.');
+      }
+      setStocks((current) => [stock, ...current.filter((item) => item.symbol !== stock.symbol)]);
+      await handleSelectStock(stock);
     } catch (error) {
       if(generation===searchGeneration.current)setSearchError(error instanceof Error ? error.message : "Stock lookup failed");
     } finally {
@@ -559,38 +652,41 @@ function Dashboard() {
     }
   }, [handleSelectStock, searchQuery, selectedMode]);
 
-  const marketDataUnavailable = marketMood?.available === false;
+  const withEffectivePermission = useCallback((stock: ScreenedStock) => {
+    const permission = scanPermissions.get(permissionKey(stock.mode, stock.symbol));
+    return withMarketPermission(withScanPermission(stock, permission), marketMood);
+  }, [scanPermissions, marketMood]);
+  const visibleStocks = useMemo(() => stocks.map(withEffectivePermission), [stocks, withEffectivePermission]);
   const detailStock = useMemo(() => {
     if (!selectedStock) return null;
+    const permitted = withEffectivePermission(selectedStock);
     const source = selectedStock.dataQuality;
     const current = source && !source.stale && clockNow > 0
       ? recheckDataQuality(source, selectedStock.mode === 'intraday', new Date(clockNow))
       : source;
     const newlyStale = current?.stale && !source?.stale;
-    const marketBlocked = marketDataUnavailable && selectedStock.mode!=='longterm';
     const shortHorizon=selectedStock.mode==='intraday'||selectedStock.mode==='btst';
     const now = new Date(clockNow);
     const cas = selectedStock.tickSizeAsOf === dateToISTString(now) ? selectedStock.casEligible ?? null : null;
     const sessionEnded=shortHorizon&&clockNow>0&&getMarketSession(now,cas).state!=='LIVE';
     const detailsPending=!selectedStock.candles.length;
     const referenceReasons = clockNow > 0 ? referenceEntryReasons(selectedStock, now) : [];
-    if (!newlyStale && !marketBlocked && !sessionEnded && !detailsPending && !referenceReasons.length) return selectedStock;
+    if (!newlyStale && !sessionEnded && !detailsPending && !referenceReasons.length) return permitted;
     return {
-      ...selectedStock,
+      ...permitted,
       nearMiss: true,
       positionRiskPercent: 0,
       researchQualified: !newlyStale&&selectedStock.researchQualified,
       dataQuality: current,
       guardReasons: [...new Set([
-        ...(selectedStock.guardReasons ?? []),
+        ...(permitted.guardReasons ?? []),
         ...referenceReasons,
         ...(newlyStale ? current.issues : []),
-        ...(marketBlocked ? ['Nifty/VIX data unavailable'] : []),
         ...(sessionEnded ? ['Continuous trading session is not confirmed open'] : []),
         ...(detailsPending ? ['Full stock history has not loaded'] : [])
       ])]
     };
-  }, [selectedStock, clockNow, marketDataUnavailable]);
+  }, [selectedStock, clockNow, withEffectivePermission]);
 
   const expiredExplanation = Boolean(analysis && (detailStock?.dataQuality?.stale ||
     (analysisMeta && clockNow >= Date.parse(analysisMeta.expiresAt))));
@@ -599,9 +695,11 @@ function Dashboard() {
     analysisError?.code === 'INSUFFICIENT_HISTORY';
   const budgetPaused = analysisError?.code === 'AI_DAILY_LIMIT';
 
-  const qualifiedCount = stocks.filter(qualifiesForShortlist).length;
+  const qualifiedCount = visibleStocks.filter(qualifiesForShortlist).length;
   const nearMissCount = stocks.length - qualifiedCount;
   const selectedPlan = selectedStock?.candles.length ? getTradePlan(selectedStock) : null;
+  const canTrackPaper = selectedPlan?.accepted && Date.parse(selectedPlan.validUntil) > clockNow &&
+    !detailStock?.nearMiss && (detailStock?.positionRiskPercent ?? 0) > 0;
 
   return (
     <div className="h-dvh flex flex-col overflow-hidden" style={{ background: "var(--bg-base)" }}>
@@ -800,10 +898,13 @@ function Dashboard() {
           </div>
           <div className="flex-1 overflow-y-auto">
             <StockList
-              stocks={stocks}
+              stocks={visibleStocks}
               removedToday={removedToday}
               selected={selectedStock}
-              onSelect={handleSelectStock}
+              onSelect={stock => {
+                const research = stocks.find(item => item.symbol === stock.symbol && item.mode === stock.mode);
+                if (research) void handleSelectStock(research);
+              }}
               loading={scanLoading}
               emptyTitle={scanError || scanStatus === 'unavailable' ? 'Scan unavailable' : refreshing ? 'Scanning this strategy' : scanStatus==='partial' ? 'Partial scan' : snapshotLoaded ? 'No matching setups' : 'No scan data yet'}
               emptyMessage={scanError ?? scanNotice ?? (scanStatus === 'partial' ? 'This scan is incomplete. Pending symbols will be checked in the next batch.' : snapshotLoaded ? 'No setups matched the selected strategy and sector in the available data.' : 'Load a saved snapshot or start a scan.')}
@@ -828,7 +929,7 @@ function Dashboard() {
                   <span className={`font-bold ${selectedStock.dayChangePercent >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                     {selectedStock.dayChangePercent >= 0 ? "▲" : "▼"}{Math.abs(selectedStock.dayChangePercent).toFixed(2)}%
                   </span>
-                  <button onClick={()=>void trackPaper()} disabled={!selectedPlan||Boolean(detailStock?.nearMiss)||paperSaved} className="rounded border border-slate-700 px-2 py-1 text-[10px] disabled:opacity-40">{paperSaved?'Paper tracked':'Track paper'}</button>
+                  <button onClick={()=>void trackPaper()} disabled={!canTrackPaper||paperSaved} className="rounded border border-slate-700 px-2 py-1 text-[10px] disabled:opacity-40">{paperSaved?'Paper tracked':'Track paper'}</button>
                   <button
                     onClick={saveToWatchlist}
                     className="rounded-md border border-slate-700 px-2 py-1 text-[10px] font-semibold text-slate-300 transition hover:border-cyan-700 hover:text-cyan-300"

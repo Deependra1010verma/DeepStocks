@@ -2,7 +2,7 @@ import { fetchCorporateEventRisk, type StockData } from "@/lib/dataFetcher";
 import { type MarketRegimeSnapshot } from "@/lib/marketRegime";
 import { type ScreenerMode, type ScreenedStock } from "@/lib/screenerEngine";
 import { dateToISTString, tradingDaysAway, latestCompletedSession, getMarketSession, todayIST } from "@/lib/timezone";
-import { entryEvidence, qualifiesForShortlist, requiresOvernightClearance } from './strategyPolicy';
+import { entryEvidence, marketEntryReasons, qualifiesForShortlist, requiresOvernightClearance } from './strategyPolicy';
 import { evaluateFundamentalQuality } from './fundamentalQuality';
 import { getTradePlan } from './tradePlan';
 import { calcATR, calcEMA, type OHLCV } from './indicators';
@@ -15,16 +15,6 @@ import { referenceEntryReasons } from './entryClearance';
 import { recheckDataQuality } from './dataQuality';
 
 const MIN_TURNOVER = 25_00_00_000; // ₹25 crore
-const STRICT_RVOL_MODES: ScreenerMode[] = ["intraday", "btst", "swing_breakout"];
-
-export function marketEntryReasons(mode: ScreenerMode, rvol: number, market: MarketRegimeSnapshot): string[] {
-  const reasons: string[] = [];
-  if (market.available === false && mode !== 'longterm') reasons.push('Nifty/VIX data unavailable');
-  if (market.defensiveMode && STRICT_RVOL_MODES.includes(mode) && rvol < 1.8) {
-    reasons.push('Defensive regime requires RVOL ≥1.8 for momentum entries');
-  }
-  return reasons;
-}
 
 function estimatedBasisPoints(value: string|undefined, fallback:number):number {
   const number=value?.trim()?Number(value):NaN;

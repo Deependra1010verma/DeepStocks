@@ -43,6 +43,219 @@ async function setup(page:Page,controls:Controls={}) {
   await page.goto('/');return {calls,errors};
 }
 const choose=(page:Page,name:string)=>page.getByRole('button').filter({hasText:`${name} test fixture`}).click();
+
+function d15Fixtures() {
+  const reference = {status:'verified-empty' as const,checkedAt:NOW.toISOString()};
+  const qualified = stock({
+    nearMiss:false, regime:'BULLISH', rvol:1.5, breakoutDaysAgo:1,
+    defaultSL:940, target1:1160, target2:1250, tickSize:0.05, tickSizeAsOf:'2026-11-18',
+    exchangePriceBand:{percent:null,publishedDay:'2026-11-17'},
+    referenceCoverage:{earnings:reference,actions:reference,asm:reference,gsm:reference}
+  });
+  const revoked = {
+    ...qualified, nearMiss:true, positionRiskPercent:0, regime:'BEARISH' as const, defensiveMode:true,
+    guardReasons:['Defensive regime requires RVOL ≥1.8 for momentum entries']
+  };
+  const portfolio = {
+    ...emptyPortfolio(), configured:true, cash:100000, reconciledAt:NOW.toISOString(),
+    policy:{...emptyPortfolio().policy,perTradePercent:1}
+  };
+  return { qualified, revoked, portfolio };
+}
+
+test('D15 applies same-acquisition risk revocation, rejects late responses, and restores verified sizing', async ({page}) => {
+  await setup(page);
+  const { qualified, revoked, portfolio } = d15Fixtures();
+  let result = qualified, revision = +NOW, defensive = false;
+  await page.route('**/api/portfolio', route => route.fulfill({json:{portfolio}}));
+  await page.route('**/api/scan?**', route => route.fulfill({json:{
+    stocks:[{...result,candles:[]}], generatedAt:NOW.toISOString(), updatedAt:new Date(revision).toISOString(),
+    expiresAt:new Date(+NOW+3600000).toISOString(), cached:true, stale:false, removedToday:[]
+  }}));
+  await page.route('**/api/stock', route => route.fulfill({json:{stock:qualified}}));
+  await page.route('**/api/market-mood', route => route.fulfill({json:{
+    available:true, regime:defensive?'BEARISH':'BULLISH', defensiveMode:defensive,
+    positionRiskPercent:defensive?0.5:1, session:{state:'LIVE',label:'MARKET OPEN',timeIST:'10:35 IST'}
+  }}));
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/analyze', async route => {
+    await delayed;
+    const oldDetail = {...qualified, dataQuality:{...qualified.dataQuality!,fetchedAt:new Date(+NOW+1000).toISOString()}};
+    await route.fulfill({json:{stock:oldDetail,analysis:{},fingerprint:guardFingerprint(oldDetail)}});
+  });
+  const poll = async (milliseconds: number) => {
+    const scan = page.waitForResponse(response => new URL(response.url()).pathname==='/api/scan');
+    await page.clock.fastForward(milliseconds);
+    await scan;
+  };
+  const reserve = page.getByRole('button',{name:/Reserve \d+ shares in journal/});
+  const track = page.getByRole('button',{name:'Track paper'});
+  const nearMiss = page.getByText('Near Miss',{exact:true});
+  try {
+    await poll(16000);
+    const started = page.waitForRequest(request => new URL(request.url()).pathname==='/api/analyze');
+    await choose(page,'ALPHA');
+    await started;
+    await expect(reserve).toHaveText('Reserve 13 shares in journal');
+    await expect(track).toBeEnabled();
+
+    result = revoked;
+    revision += 15000;
+    defensive = true;
+    await poll(46000);
+    await expect(page.getByText('Defensive Mode.',{exact:true})).toBeVisible();
+    await expect(nearMiss).toBeVisible();
+    await expect(reserve).toHaveCount(0);
+    await expect(track).toBeDisabled();
+    await page.getByRole('button',{name:'Copy Setup',exact:true}).click();
+    expect(await page.evaluate(()=> (window as unknown as {copied:string}).copied)).toContain('Qty: 0');
+
+    const late = page.waitForResponse(response => new URL(response.url()).pathname==='/api/analyze');
+    release();
+    await (await late).finished();
+    await expect(page.getByText('AI explanation with quant guardrails',{exact:true})).toHaveCount(0);
+    await expect(track).toBeDisabled();
+
+    // A delayed older scan cannot roll back the current sidebar or detail.
+    result = qualified;
+    revision -= 15000;
+    defensive = false;
+    await poll(60000);
+    await expect(page.getByText('Defensive Mode.',{exact:true})).toHaveCount(0);
+    await expect(nearMiss).toBeVisible();
+    await expect(reserve).toHaveCount(0);
+
+    result = {...qualified,rvol:2,regime:'BEARISH',defensiveMode:true,positionRiskPercent:0.5};
+    revision += 30000;
+    defensive = true;
+    await poll(60000);
+    await expect(page.getByText('Defensive Mode.',{exact:true})).toBeVisible();
+    await expect(nearMiss).toHaveCount(0);
+    await expect(reserve).toHaveText('Reserve 6 shares in journal');
+    await expect(track).toBeEnabled();
+
+    result = {...qualified,rvol:2};
+    revision += 15000;
+    defensive = false;
+    await poll(60000);
+    await expect(reserve).toHaveText('Reserve 13 shares in journal');
+    await expect(track).toBeEnabled();
+  } finally {
+    release();
+  }
+});
+
+for (const variant of ['removed','late-detail'] as const) {
+  const title = variant === 'removed' ? 'explicit removal revokes the open setup' : 'reaffirmed revocation survives a late detail response';
+  test(`D15 ${title}`, async ({page}) => {
+    await setup(page);
+    const { qualified, revoked, portfolio } = d15Fixtures();
+
+    let revision = +NOW;
+    let removed = false;
+    let partial = false;
+    let candidate = variant === 'removed' ? qualified : revoked;
+    let release!: () => void;
+    const delay = new Promise<void>(resolve => { release = resolve; });
+    const other = stock({symbol:'DELTA.NS',name:'DELTA test fixture'});
+    await page.route('**/api/portfolio', route => route.fulfill({json:{portfolio}}));
+    await page.route('**/api/scan?**', route => {
+      const mode = new URL(route.request().url()).searchParams.get('mode');
+      const cards = mode === 'swing_pullback' ? [{...qualified, mode}] : partial || removed ? [other] : [candidate, other];
+      return route.fulfill({json:{
+        stocks: cards.map(card => ({...card, candles:[]})),
+        generatedAt: NOW.toISOString(), updatedAt: new Date(revision).toISOString(),
+        expiresAt: new Date(+NOW+3600000).toISOString(),
+        status: partial ? 'partial' : 'ready', cached:true, stale:false,
+        removedToday: mode === 'swing_breakout' && removed ? [{
+          symbol: qualified.symbol, name: qualified.name, sector: qualified.sector, quantScore: qualified.quantScore,
+          reason: revoked.guardReasons[0], removedAt: new Date(revision).toISOString(), lastSeenAt: NOW.toISOString()
+        }] : []
+      }});
+    });
+    await page.route('**/api/market-mood',r=>r.fulfill({json:{available:true,regime:'BULLISH',defensiveMode:false,positionRiskPercent:1,session:{state:'LIVE',label:'MARKET OPEN',timeIST:'10:35 IST'}}}));
+    await page.route('**/api/analyze',r=>r.fulfill({status:503,json:{error:'Offline explanation'}}));
+    await page.route('**/api/stock', async route => {
+      if (variant === 'late-detail') await delay;
+      const { mode } = route.request().postDataJSON();
+      await route.fulfill({json:{stock:{
+        ...qualified, mode, dataQuality:{...qualified.dataQuality!,fetchedAt:new Date(+NOW+1000).toISOString()}
+      }}});
+    });
+    const poll=async()=>{
+      const scan=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/scan');
+      await page.clock.fastForward(16000); await (await scan).finished();
+    };
+    const reserve=page.getByRole('button',{name:/Reserve .*shares in journal/});
+    const track=page.getByRole('button',{name:'Track paper'});
+    try {
+      await poll();
+      const started=page.waitForRequest(r=>new URL(r.url()).pathname==='/api/stock');
+      await choose(page,'ALPHA'); await started;
+      if (variant === 'removed') {
+        await expect(reserve).toHaveText('Reserve 13 shares in journal');
+        partial = true;
+        revision += 10000;
+        await poll();
+        await expect(page.getByRole('button').filter({hasText:'ALPHA test fixture'})).toHaveCount(0);
+        await expect(reserve).toHaveText('Reserve 13 shares in journal');
+        partial = false;
+        removed = true;
+      } else {
+        await expect(track).toBeDisabled();
+      }
+      revision += 30000;
+      await poll();
+      if (removed) {
+        await expect(page.getByText('Removed Today',{exact:true})).toBeVisible();
+        await expect(page.getByRole('button').filter({hasText:'ALPHA test fixture'})).toHaveCount(0);
+      } else {
+        await expect(page.getByText('Near Miss',{exact:true})).toBeVisible();
+        const completed=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/analyze');
+        release(); await (await completed).finished();
+        await expect(page.getByText('Offline explanation',{exact:true})).toBeVisible();
+      }
+      await page.getByRole('button',{name:'Copy Setup',exact:true}).click();
+      const copied=await page.evaluate(()=>(window as unknown as {copied:string}).copied);
+      expect(copied).toContain('Qty: 0');
+      await expect(reserve).toHaveCount(0);
+      await expect(track).toBeDisabled();
+
+      if (variant === 'removed') {
+        // A partial scan can omit prior removals. A direct lookup still opens the research.
+        removed = false;
+        partial = true;
+        revision += 15000;
+        await poll();
+        await expect(page.getByText('Removed Today',{exact:true})).toHaveCount(0);
+        const search = page.getByRole('textbox',{name:'Search NSE symbol'});
+        await search.fill('ALPHA');
+        await search.press('Enter');
+        await expect(page.getByText('Offline explanation',{exact:true})).toBeVisible();
+        await expect(track).toBeDisabled();
+
+        await page.getByRole('button',{name:'Swing PB',exact:true}).click();
+        await choose(page,'ALPHA');
+        await expect(track).toBeEnabled();
+        await page.getByRole('button',{name:'Swing BO',exact:true}).click();
+        await search.fill('ALPHA');
+        await search.press('Enter');
+        await expect(page.getByText('Offline explanation',{exact:true})).toBeVisible();
+        await expect(track).toBeDisabled();
+        await expect(reserve).toHaveCount(0);
+      }
+
+      partial = false;
+      candidate = qualified;
+      revision += 15000;
+      await poll();
+      await expect(reserve).toHaveText('Reserve 13 shares in journal');
+      await expect(track).toBeEnabled();
+    } finally {release();}
+  });
+}
+
 test('private bootstrap does not request stocks before authentication',async({page})=>{const {calls}=await setup(page,{anonymous:true});await expect(page.getByLabel('Password')).toBeVisible();expect(calls.some(c=>c.path==='/api/scan')).toBe(false);});
 test('desktop report, chart and canonical copied quantity',async({page})=>{const {calls,errors}=await setup(page);await choose(page,'ALPHA');await expect(page.getByText('AI explanation with quant guardrails',{exact:true})).toBeVisible();await expect(page.locator('canvas').first()).toBeVisible();await page.getByRole('textbox',{name:'Trading capital'}).fill('900000');await page.getByRole('button',{name:'Copy Setup',exact:true}).click();const copied=await page.evaluate(()=>(window as unknown as {copied:string}).copied);expect(copied).toContain('SL: ₹970.00');expect(copied).toContain('Qty: 0');expect(calls.filter(c=>c.path==='/api/ledger'&&c.method==='POST')).toHaveLength(0);expect(errors).toEqual([]);await page.clock.runFor(450);await page.screenshot({path:'test-results/desktop.png',animations:'disabled'});});
 test('keyboard navigation reuses the cached report and preserves analyzed CMP',async({page})=>{const {calls}=await setup(page);await choose(page,'ALPHA');await expect(page.getByText('AI explanation with quant guardrails',{exact:true})).toBeVisible();await page.keyboard.press('/');await expect(page.getByRole('textbox',{name:'Search NSE symbol'})).toBeFocused();await page.getByRole('textbox',{name:'Search NSE symbol'}).evaluate(e=>(e as HTMLInputElement).blur());await page.keyboard.press('ArrowDown');await expect(page.getByRole('heading',{name:'DELTA',exact:true})).toBeVisible();const count=calls.filter(c=>c.path==='/api/analyze').length;await page.keyboard.press('ArrowUp');await expect(page.getByText('AI explanation with quant guardrails',{exact:true})).toBeVisible();expect(calls.filter(c=>c.path==='/api/analyze')).toHaveLength(count);});

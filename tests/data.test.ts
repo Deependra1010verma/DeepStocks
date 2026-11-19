@@ -134,6 +134,7 @@ it('blocks paper registration independently of qualification flags when coverage
   const [allowed] = await applyInstitutionalGuards('positional',[candidate],data,market,undefined,instruments,exchange);
   const write = vi.spyOn(SignalLedger, 'findOneAndUpdate').mockReturnValue({lean:async()=>({status:'PENDING'})} as never);
   try {
+    await expect(recordPaperSignal({...allowed,nearMiss:true,positionRiskPercent:0})).rejects.toMatchObject({code:'NOT_QUALIFIED'});
     await expect(recordPaperSignal({...allowed,referenceCoverage:undefined})).rejects.toMatchObject({code:'NOT_QUALIFIED'});
     expect(write).not.toHaveBeenCalled();
     await expect(recordPaperSignal(allowed)).resolves.toMatchObject({status:'PENDING'});

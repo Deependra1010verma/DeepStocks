@@ -17,6 +17,19 @@ export function qualifiesForShortlist(stock: Pick<ScreenedStock, 'nearMiss' | 'r
 export function requiresOvernightClearance(mode: ScreenerMode) {
   return mode !== 'intraday' && mode !== 'longterm';
 }
+
+const STRICT_RVOL_MODES: ScreenerMode[] = ['intraday', 'btst', 'swing_breakout'];
+
+export function marketEntryReasons(
+  mode: ScreenerMode, rvol: number, market: { available?: boolean; defensiveMode?: boolean }
+): string[] {
+  const reasons: string[] = [];
+  if (market.available === false && mode !== 'longterm') reasons.push('Nifty/VIX data unavailable');
+  if (market.defensiveMode && STRICT_RVOL_MODES.includes(mode) && rvol < 1.8) {
+    reasons.push('Defensive regime requires RVOL ≥1.8 for momentum entries');
+  }
+  return reasons;
+}
 export const STRATEGY_POLICIES: Record<
   ScreenerMode,
   { trigger: string; minNetRR: number; entrySessions: number }

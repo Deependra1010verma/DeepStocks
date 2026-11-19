@@ -74,6 +74,33 @@ it('rejects a journal reservation at the API before any save after the daily los
   } finally { vi.useRealTimers(); }
 });
 
+it('re-resolves a revoked D15 setup before rejecting the previously displayed reservation', async () => {
+  vi.useFakeTimers({toFake:['Date']});
+  vi.setSystemTime(NOW);
+  try {
+    const p = applyPortfolioAction(
+      {...emptyPortfolio(), configured:true, cash:100000, policy:{...DEFAULT_RISK_POLICY,perTradePercent:1}},
+      {id:'review-today',type:'reconcile'}, NOW
+    );
+    const reference = {status:'verified-empty' as const,checkedAt:NOW.toISOString()};
+    sources.read.mockResolvedValue(p);
+    sources.resolve.mockResolvedValue(stock({
+      symbol:'NEW.NS', nearMiss:true, positionRiskPercent:0, rvol:1.5, regime:'BEARISH', defensiveMode:true,
+      breakoutDaysAgo:1, defaultSL:940, target1:1160, target2:1250, tickSize:0.05, tickSizeAsOf:'2026-11-18',
+      referenceCoverage:{earnings:reference,actions:reference,asm:reference,gsm:reference},
+      exchangePriceBand:{publishedDay:'2026-11-17',percent:null}
+    }));
+    const response = await POST(new NextRequest('https://deepstocks.test/api/portfolio',{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({version:p.version,action:{id:'reserve-test',type:'reserve',symbol:'NEW',mode:'swing_breakout',quantity:13}})
+    }));
+    expect(sources.resolve).toHaveBeenLastCalledWith('NEW.NS','swing_breakout');
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({code:'RISK_LIMIT',error:'Current setup/regime clears zero risk'});
+    expect(sources.save).not.toHaveBeenCalled();
+  } finally { vi.useRealTimers(); }
+});
+
 it('reconciles a partial sale, fees and cash flows from the prior close while retaining exposure caps', () => {
   let p = carriedPortfolio();
   p = applyPortfolioAction(p,{...buy,id:'fill-sell-1',side:'SELL',quantity:50,price:90,fees:10,stop:undefined},NOW);

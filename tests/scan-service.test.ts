@@ -55,7 +55,7 @@ it('shares overlapping sector reads and evaluates expiry without changing source
     exchangePriceBand: { publishedDay: '2026-11-18', percent: 10 },
     referenceCoverage: { earnings: report, actions: report, asm: report, gsm: report } });
   const snapshot = { version: SCAN_VERSION, stocks: [current, { ...current, symbol: 'B.NS', sector: 'Banking' }],
-    removedToday: [], generatedAt: NOW, expiresAt: new Date(+NOW + 3000) };
+    removedToday: [], generatedAt: NOW, updatedAt: new Date(+NOW + 1), expiresAt: new Date(+NOW + 3000) };
   mocks.snapshot = snapshot;
   mocks.read.mockImplementationOnce(async () => {
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -71,6 +71,7 @@ it('shares overlapping sector reads and evaluates expiry without changing source
   expect(sectorResponse.headers.get('Cache-Control')).toBe('no-store');
   expect((await allResponse.json()).stocks).toHaveLength(2);
   const first = await sectorResponse.json();
+  expect(first.updatedAt).toBe(snapshot.updatedAt.toISOString());
   expect(first.stocks).toHaveLength(1);
   expect(first.stocks[0]).toMatchObject({ positionRiskPercent: 1, candles: [] });
 
@@ -166,6 +167,7 @@ it('all-provider failure preserves the previous snapshot time and cards as unver
   mocks.batch.mockResolvedValue(batch([], ['A', 'B', 'C']));
   const result = await refreshScan('btst', 'All');
   expect(+result.generatedAt).toBe(+NOW - 3600000); expect(result.stocks[0].nearMiss).toBe(true);
+  expect(result.updatedAt).toEqual(NOW);
   expect(result.status).toBe('unavailable'); expect(result.coverage?.processed).toBe(0);
 });
 it('recomputes sector concentration across successful batches', async () => {
@@ -211,6 +213,7 @@ it.each([
     });
   }
   const resumed = await refreshScan('swing_breakout', 'All');
+  expect(+resumed.updatedAt!).toBeGreaterThan(+first.updatedAt!);
   const carried = resumed.stocks.find(s => s.symbol === 'A');
   expect(carried).toMatchObject({ nearMiss: !!reason, awaitingRevalidation: !!reason, positionRiskPercent: reason ? 0 : 0.5,
     dataQuality: { fetchedAt: first.stocks[0].dataQuality!.fetchedAt } });

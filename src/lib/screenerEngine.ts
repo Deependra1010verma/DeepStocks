@@ -1,12 +1,37 @@
 import {
-  calcEMA, calcRSI, calcMACD, calcATR, calcSMA, calcVWAP, highestHigh, OHLCV,
+  calcEMA, calcRSI, calcMACD, calcATR, calcVWAP, highestHigh, OHLCV,
 } from "./indicators";
 import { StockData, FundamentalData } from "./dataFetcher";
-import { todayIST, dateToISTString } from "./timezone";
+import { dateToISTString, latestCompletedSession } from "./timezone";
+import { computeRVOL, type RelativeVolume } from './relativeVolume';
+import type { DataQuality } from './dataQuality';
+import { confirmBtstMomentum, confirmDailyReversal, confirmIntradayBreakout } from './entrySignals';
+import type { SectorBenchmark } from './sectorBenchmarks';
+import type { NseCorporateEvent } from './nseCorporateEvents';
+import type { SurveillanceEntry } from './nseSurveillance';
+import type { NsePriceBand } from './nsePriceBands';
 
 export type ScreenerMode = "intraday" | "btst" | "swing_breakout" | "swing_pullback" | "positional" | "longterm";
 
 export interface ScreenedStock {
+  tickSize?: number;
+  tickSizeAsOf?: string;
+  casEligible?: boolean;
+  breakoutLevel?: number;
+  entryConfirmationAt?: string;
+  researchQualified?: boolean;
+  estimatedCostBps?: number;
+  estimatedSlippageBps?: number;
+  dataQuality?: DataQuality;
+  eventStatus?: 'known' | 'unknown';
+  exchangeEvents?: NseCorporateEvent[];
+  eventConflict?: boolean;
+  surveillance?: SurveillanceEntry[];
+  exchangePriceBand?: NsePriceBand;
+  guardReasons?: string[];
+  primaryRank?: boolean;
+  verificationNote?: string;
+  monthlyTrend?: 'BULLISH' | 'NEUTRAL' | 'BEARISH' | 'UNAVAILABLE';
   symbol: string;
   name: string;
   sector: string;
@@ -15,10 +40,11 @@ export interface ScreenedStock {
   dayChangePercent: number;
   rsi: number;
   rvol: number;
+  relativeVolume?: RelativeVolume | null;
   atr: number;
   ema20: number;
   ema50: number;
-  ema200: number;
+  ema200: number | null;
   macdLine: number;
   macdSignal: number;
   vwap: number;
@@ -36,20 +62,40 @@ export interface ScreenedStock {
   weeklyTrend: "BULLISH" | "NEUTRAL" | "BEARISH" | "UNAVAILABLE";
   breakoutDaysAgo: number | null;
   sectorBoost: number;
+  sectorBenchmark?: SectorBenchmark;
   nearMiss?: boolean;
+  lifecycleState?: "NEW" | "ACTIVE";
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  awaitingRevalidation?: boolean;
+  earningsDate?: string | null;
+  corporateEventDate?: string | null;
+  corporateEventType?: string | null;
+  earningsRisk?: boolean;
+  earningsDaysAway?: number | null;
+  liquidityTurnover?: number | null;
+  liquidityPass?: boolean;
+  circuitLockedRecent?: boolean;
+  liquidityWarning?: string;
+  sectorCluster?: boolean;
+  defensiveMode?: boolean;
+  riskMultiplier?: number;
+  positionRiskPercent?: number;
+  regime?: "BULLISH" | "NEUTRAL" | "BEARISH";
+  regimeReason?: string;
 }
 
 function safeNum(arr: number[]): number {
   return arr.length > 0 ? arr[arr.length - 1] : 0;
 }
 
-function getExtension(cmp: number, ema20: number, vwap: number, atr: number) {
+function getExtension(cmp: number, ema20: number, vwap: number, atr: number, intraday = false) {
   const extensionRatio = atr > 0 ? Math.max(0, (cmp - ema20) / atr) : 0;
   const vwapExtensionRatio = atr > 0 && vwap > 0 ? Math.max(0, (cmp - vwap) / atr) : 0;
   return {
     extensionRatio,
     vwapExtensionRatio,
-    extensionWarning: extensionRatio > 2.5 || vwapExtensionRatio > 2,
+    extensionWarning: extensionRatio > 2.5 || (intraday && vwapExtensionRatio > 2),
   };
 }
 
@@ -64,67 +110,49 @@ function getWeeklyTrend(candles?: OHLCV[]): "BULLISH" | "NEUTRAL" | "BEARISH" | 
   return "NEUTRAL";
 }
 
-function findBreakoutDaysAgo(candles: OHLCV[]): number | null {
+function completedDailyBars(candles: OHLCV[], now = new Date()): OHLCV[] {
+  const completed = latestCompletedSession(now);
+  return completed ? candles.filter(c => dateToISTString(new Date(c.date)) <= completed) : [];
+}
+export function findBreakoutDaysAgo(candles: OHLCV[], now = new Date()): number | null {
+  candles = completedDailyBars(candles, now);
   for (let daysAgo = 0; daysAgo <= 2; daysAgo++) {
     const index = candles.length - 1 - daysAgo;
-    if (index < 21) continue;
+    if (index < 20) continue;
     const prior = candles.slice(index - 20, index);
     const priorHigh = Math.max(...prior.map((c) => c.high));
     const averageVolume = prior.reduce((sum, c) => sum + c.volume, 0) / prior.length;
     const candle = candles[index];
-    if (candle.close >= priorHigh * 0.995 && candle.volume >= averageVolume * 1.2) return daysAgo;
+    if (candle.close > priorHigh && candle.volume >= averageVolume * 1.2) return daysAgo;
   }
   return null;
 }
+export function breakoutRetest(candles: OHLCV[], atr: number, now = new Date()): { level:number; bar:OHLCV } | null {
+  const days = findBreakoutDaysAgo(candles, now);
+  if (days == null || days===0 || atr<=0) return null;
+  const complete=completedDailyBars(candles,now), index=complete.length-1-days;
+  const level=Math.max(...complete.slice(index-20,index).map(c=>c.high));
+  const subsequent=complete.slice(index+1);
+  if(subsequent.some(c=>c.close<level))return null;
+  const bar=subsequent.at(-1)!;
+  return bar.low>=level-0.5*atr&&bar.low<=level+0.25*atr&&bar.close>=level ? {level,bar}:null;
+}
 
 function buildSectorBoosts(stocks: Map<string, StockData>): Map<string, number> {
-  const bySector = new Map<string, number[]>();
-  for (const data of stocks.values()) {
-    const sector = data.sector ?? "Unknown";
-    const values = bySector.get(sector) ?? [];
-    values.push(data.dayChangePercent);
-    bySector.set(sector, values);
-  }
-  const averages = [...bySector.entries()].map(([sector, values]) => ({
-    sector,
-    average: values.reduce((sum, value) => sum + value, 0) / values.length,
-  }));
-  const sorted = averages.map((entry) => entry.average).sort((a, b) => a - b);
-  const median = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : 0;
-  return new Map(averages.map(({ sector, average }) => [
-    sector,
-    Math.max(-10, Math.min(10, Math.round((average - median) * 3))),
-  ]));
+  return new Map([...stocks.values()].map(data => [data.sector ?? 'Unknown', data.sectorBenchmark?.scoreBoost ?? 0]));
 }
 
-/** Compute RVOL properly from daily candle volumes (last 20 days avg vs last day) */
-function computeRVOL(candles: OHLCV[], quoteVolume: number, isIntraday: boolean): number {
-  if (candles.length < 5) return 1;
-  if (isIntraday) {
-    // For 15m candles: sum all candles from today, compare to avg day volume from last 10 days
-    const todayStr = todayIST();
-    const todayCandles = candles.filter(c => dateToISTString(new Date(c.date)) === todayStr);
-    const todayVol = todayCandles.reduce((s, c) => s + c.volume, 0);
-    // Avg daily volume: take 10 days excluding today
-    const otherDays = new Map<string, number>();
-    for (const c of candles) {
-      const d = dateToISTString(new Date(c.date));
-      if (d !== todayStr) otherDays.set(d, (otherDays.get(d) ?? 0) + c.volume);
-    }
-    const dayVols = Array.from(otherDays.values()).slice(-10);
-    if (dayVols.length === 0) return 1;
-    const avgDayVol = dayVols.reduce((a, b) => a + b, 0) / dayVols.length;
-    return avgDayVol > 0 ? (todayVol > 0 ? todayVol / avgDayVol : quoteVolume / avgDayVol) : 1;
-  }
-  // Daily candles: use last candle volume vs 20-day SMA of volumes
-  const vols = candles.map(c => c.volume);
-  const sma = calcSMA(vols, 20);
-  const avgVol = safeNum(sma);
-  const lastVol = quoteVolume > 0 ? quoteVolume : (vols.at(-1) ?? 0);
-  return avgVol > 0 ? lastVol / avgVol : 1;
+function stockRelativeVolume(data: StockData, intraday = false) {
+  const quoteVolume = data.quoteVolume === undefined ? data.volume : data.quoteVolume;
+  return computeRVOL(data.candles, quoteVolume, intraday, data.dataQuality?.quoteAt);
 }
 
-function computeQuantScore(params: {
+export function sessionVWAP(candles: OHLCV[]): number {
+  const date = candles.at(-1)?.date;
+  return date ? calcVWAP(candles.filter(c => dateToISTString(new Date(c.date)) === dateToISTString(new Date(date)))) : 0;
+}
+
+export function computeQuantScore(params: {
   rsi: number;
   rvol: number;
   dayChangePct: number;
@@ -134,6 +162,7 @@ function computeQuantScore(params: {
   closingStrength: number; // 0-1
   sectorBoost: number;
 }): number {
+  if (Object.values(params).some(value => typeof value === 'number' && !Number.isFinite(value))) return 0;
   let score = 0;
   // RSI score (0-20)
   if (params.rsi >= 55 && params.rsi <= 70) score += 20;
@@ -141,7 +170,7 @@ function computeQuantScore(params: {
   else if (params.rsi > 70 && params.rsi <= 80) score += 10;
   else if (params.rsi >= 45 && params.rsi < 50) score += 6;
   // RVOL score (0-20) — capped at 5x to handle data anomalies
-  const rvolCapped = Math.min(params.rvol, 5);
+  const rvolCapped = Math.max(0, Math.min(params.rvol, 5));
   if (rvolCapped >= 2.0) score += 20;
   else if (rvolCapped >= 1.5) score += 14;
   else if (rvolCapped >= 1.0) score += 8;
@@ -156,30 +185,26 @@ function computeQuantScore(params: {
   else if (params.dayChangePct >= 0.3) score += 5;
   else if (params.dayChangePct > 0) score += 2;
   // Closing strength (0-10)
-  score += Math.round(params.closingStrength * 10);
+  score += Math.round(Math.max(0, Math.min(1, params.closingStrength)) * 10);
   // Fundamentals (0-10)
   score += Math.min(10, Math.round(params.fundamentalScore / 3));
   // Relative sector strength bonus/penalty (-10 to +10)
   score += params.sectorBoost;
-  return Math.min(100, score);
+  return Math.max(0, Math.min(100, score));
 }
 
-/** Always return something — if no qualified, expand near-miss; if still nothing, return top-N by score */
-function finalizeResults(
+function failedRules(rules: Array<[boolean, string]>): string[] {
+  return rules.filter(([passed]) => !passed).map(([, reason]) => reason);
+}
+
+/** Rank evaluated symbols, with qualifiers first. */
+export function finalizeResults(
   results: ScreenedStock[],
   nearMisses: ScreenedStock[],
   all: ScreenedStock[],
-  topN = 10,
-  nearN = 5
 ): ScreenedStock[] {
-  if (results.length > 0) {
-    return results.sort((a, b) => b.quantScore - a.quantScore).slice(0, topN);
-  }
-  if (nearMisses.length > 0) {
-    return nearMisses.sort((a, b) => b.quantScore - a.quantScore).slice(0, nearN).map(s => ({ ...s, nearMiss: true }));
-  }
-  // Last resort: show top stocks by quantScore anyway (marked nearMiss)
-  return all.sort((a, b) => b.quantScore - a.quantScore).slice(0, nearN).map(s => ({ ...s, nearMiss: true }));
+  const qualified = new Set(results.map(s => s.symbol));
+  return [...new Map([...results, ...nearMisses, ...all].map(s => [s.symbol, { ...s, nearMiss: !qualified.has(s.symbol) }])).values()].sort((a, b) => Number(a.nearMiss) - Number(b.nearMiss) || b.quantScore - a.quantScore);
 }
 
 // ═══════════════════════════════════════════
@@ -187,36 +212,37 @@ function finalizeResults(
 // ═══════════════════════════════════════════
 export function screenIntraday(stocks: Map<string, StockData>): ScreenedStock[] {
   const results: ScreenedStock[] = [];
-  const nearMisses: ScreenedStock[] = [];
   const allStocks: ScreenedStock[] = [];
   const sectorBoosts = buildSectorBoosts(stocks);
 
   for (const [symbol, data] of stocks) {
     const sectorBoost = sectorBoosts.get(data.sector ?? "Unknown") ?? 0;
     const { candles, currentPrice, dayChangePercent, volume, fundamentals, name } = data;
-    if (candles.length < 15) continue;
+    if (candles.length < 50) continue;
 
     const closes = candles.map((c) => c.close);
     const rsiArr = calcRSI(closes);
     const atrArr = calcATR(candles);
-    const ema20Arr = calcEMA(closes, Math.min(20, closes.length - 1));
-    const ema50Arr = calcEMA(closes, Math.min(50, closes.length - 1));
+    const ema20Arr = calcEMA(closes, 20);
+    const ema50Arr = calcEMA(closes, 50);
     const macdArr = calcMACD(closes);
 
     const rsi = safeNum(rsiArr);
     const atr = safeNum(atrArr);
-    const vwap = calcVWAP(candles.slice(-20));
-    const rvol = computeRVOL(candles, volume, true);
+    const vwap = sessionVWAP(candles);
+    const relativeVolume = stockRelativeVolume(data, true);
+    const rvol = relativeVolume?.value ?? 0;
     const ema20 = safeNum(ema20Arr);
     const ema50 = safeNum(ema50Arr);
-    const ema200 = calcEMA(closes, Math.min(200, closes.length - 1)).at(-1) ?? ema50;
+    const ema200 = calcEMA(closes, 200).at(-1) ?? null;
     const macdLast = macdArr.at(-1);
     const macdLine = macdLast?.MACD ?? 0;
     const macdSignal = macdLast?.signal ?? 0;
     const atrPct = currentPrice > 0 ? (atr / currentPrice) * 100 : 0;
-    const extension = getExtension(currentPrice, ema20, vwap, atr);
+    const extension = getExtension(currentPrice, ema20, vwap, atr, true);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
-    const breakoutDaysAgo = findBreakoutDaysAgo(candles);
+    const breakoutDaysAgo = null;
+    const signal=confirmIntradayBreakout(candles,data.dataQuality?.quoteAt);
 
     const lastCandle = candles.at(-1)!;
     const closingStrength = lastCandle.high !== lastCandle.low
@@ -230,34 +256,33 @@ export function screenIntraday(stocks: Map<string, StockData>): ScreenedStock[] 
 
     const stock: ScreenedStock = {
       symbol, name, sector: data.sector ?? "", cmp: currentPrice, dayChange: data.dayChange,
-      dayChangePercent, rsi, rvol, atr, ema20, ema50, ema200, macdLine, macdSignal,
+      dayChangePercent, rsi, rvol, relativeVolume, atr, ema20, ema50, ema200, macdLine, macdSignal,
       vwap, volume, quantScore, mode: "intraday", fundamentals, candles,
-      defaultSL: currentPrice - 1.2 * atr,
+      defaultSL: signal?Math.min(signal.level-0.25*atr,currentPrice-0.25*atr):currentPrice-1.2*atr,
       target1: currentPrice + 2.0 * atr,
       target2: currentPrice + 3.5 * atr,
       ...extension,
       weeklyTrend,
       breakoutDaysAgo,
+      ...(signal?{breakoutLevel:signal.level,entryConfirmationAt:signal.at}:{}),
       sectorBoost,
     };
 
+    stock.guardReasons = failedRules([
+      [signal !== null, 'Completed intraday breakout not confirmed'],
+      [!signal || currentPrice >= signal.level, 'Price fell below the intraday breakout level'],
+      [currentPrice > vwap, 'Price is at or below session VWAP'],
+      [!extension.extensionWarning, 'Extended move — wait for a pullback'],
+      [rvol >= 1.5, 'Intraday RVOL below 1.5× or baseline unavailable'],
+      [rsi >= 55 && rsi <= 80, 'Intraday RSI outside 55–80'],
+      [dayChangePercent >= 0.5 && dayChangePercent <= 6, 'Session gain outside 0.5–6%'],
+      [atrPct >= 0.3, 'Intraday ATR below 0.3% of price']
+    ]);
     allStocks.push(stock);
-
-    const passesAllFilters =
-      currentPrice > vwap &&
-      !extension.extensionWarning &&
-      rvol >= 1.5 &&
-      rsi >= 55 && rsi <= 80 &&
-      dayChangePercent >= 0.5 && dayChangePercent <= 6 &&
-      atrPct >= 0.3;
-
-    if (passesAllFilters) results.push(stock);
-    else if (rvol >= 1.0 && rsi >= 48 && dayChangePercent >= 0.2) {
-      nearMisses.push(stock);
-    }
+    if (!stock.guardReasons.length) results.push(stock);
   }
 
-  return finalizeResults(results, nearMisses, allStocks);
+  return finalizeResults(results, [], allStocks);
 }
 
 // ═══════════════════════════════════════════
@@ -265,28 +290,28 @@ export function screenIntraday(stocks: Map<string, StockData>): ScreenedStock[] 
 // ═══════════════════════════════════════════
 export function screenBTST(stocks: Map<string, StockData>): ScreenedStock[] {
   const results: ScreenedStock[] = [];
-  const nearMisses: ScreenedStock[] = [];
   const allStocks: ScreenedStock[] = [];
   const sectorBoosts = buildSectorBoosts(stocks);
 
   for (const [symbol, data] of stocks) {
     const sectorBoost = sectorBoosts.get(data.sector ?? "Unknown") ?? 0;
     const { candles, currentPrice, dayChangePercent, volume, fundamentals, name } = data;
-    if (candles.length < 20) continue;
+    if (candles.length < 50) continue;
 
     const closes = candles.map((c) => c.close);
     const rsiArr = calcRSI(closes);
     const atrArr = calcATR(candles);
-    const ema20Arr = calcEMA(closes, Math.min(20, closes.length - 1));
-    const ema50Arr = calcEMA(closes, Math.min(50, closes.length - 1));
+    const ema20Arr = calcEMA(closes, 20);
+    const ema50Arr = calcEMA(closes, 50);
     const macdArr = calcMACD(closes);
 
     const rsi = safeNum(rsiArr);
     const atr = safeNum(atrArr);
-    const rvol = computeRVOL(candles, volume, false);
+    const relativeVolume = stockRelativeVolume(data);
+    const rvol = relativeVolume?.value ?? 0;
     const ema20 = safeNum(ema20Arr);
     const ema50 = safeNum(ema50Arr);
-    const ema200 = calcEMA(closes, Math.min(200, closes.length - 1)).at(-1) ?? ema50;
+    const ema200 = calcEMA(closes, 200).at(-1) ?? null;
     const macdLast = macdArr.at(-1);
     const macdLine = macdLast?.MACD ?? 0;
     const macdSignal = macdLast?.signal ?? 0;
@@ -294,12 +319,16 @@ export function screenBTST(stocks: Map<string, StockData>): ScreenedStock[] {
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
     const breakoutDaysAgo = findBreakoutDaysAgo(candles);
+    const signal=confirmBtstMomentum(data.confirmationCandles??[],data.dataQuality?.quoteAt);
+    const completedSession=latestCompletedSession();
+    const prevSessionCandle=completedSession
+      ? candles.findLast(candle=>dateToISTString(new Date(candle.date))===completedSession)
+      : undefined;
 
     const lastCandle = candles.at(-1)!;
-    const prevCandle = candles.at(-2)!;
-    const closingStrength = lastCandle.high !== lastCandle.low
+    const closingStrength = signal?.closingStrength ?? (lastCandle.high !== lastCandle.low
       ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
-      : 0.5;
+      : 0.5);
     const emaTrend = currentPrice > ema20 && ema20 > ema50 ? 1 : (currentPrice > ema50 ? 0 : -1);
     const quantScore = computeQuantScore({
       rsi, rvol, dayChangePct: dayChangePercent, macdBullish: macdLine > macdSignal,
@@ -308,33 +337,32 @@ export function screenBTST(stocks: Map<string, StockData>): ScreenedStock[] {
 
     const stock: ScreenedStock = {
       symbol, name, sector: data.sector ?? "", cmp: currentPrice, dayChange: data.dayChange,
-      dayChangePercent, rsi, rvol, atr, ema20, ema50, ema200, macdLine, macdSignal,
+      dayChangePercent, rsi, rvol, relativeVolume, atr, ema20, ema50, ema200, macdLine, macdSignal,
       vwap, volume, quantScore, mode: "btst", fundamentals, candles,
-      defaultSL: currentPrice * 0.985,
+      defaultSL: signal ? Math.min(signal.level - 0.15 * atr, currentPrice - 0.25 * atr) : currentPrice * 0.985,
       target1: currentPrice * 1.03,
       target2: currentPrice * 1.055,
       ...extension,
       weeklyTrend,
       breakoutDaysAgo,
+      ...(signal?{entryConfirmationAt:signal.at}:{}),
       sectorBoost,
     };
 
+    stock.guardReasons = failedRules([
+      [signal !== null, 'Completed late-session BTST momentum candle not confirmed'],
+      [!signal || currentPrice >= signal.level, 'Price fell below the BTST momentum candle low'],
+      [!extension.extensionWarning, 'Extended move — wait for a pullback'],
+      [!signal || closingStrength >= 0.75, 'Late-session close is outside the top quarter of its range'],
+      [rvol >= 1.5, 'BTST RVOL below 1.5× or baseline unavailable'],
+      [!!prevSessionCandle && currentPrice >= prevSessionCandle.high * 0.99, 'Price has not reached the prior-session high area'],
+      [rsi >= 55, 'Daily RSI below 55']
+    ]);
     allStocks.push(stock);
-
-    const passesAllFilters =
-      !extension.extensionWarning &&
-      closingStrength >= 0.75 &&
-      rvol >= 1.5 &&
-      lastCandle.close >= prevCandle.high * 0.99 &&
-      rsi >= 55;
-
-    if (passesAllFilters) results.push(stock);
-    else if (closingStrength >= 0.6 && rsi >= 48) {
-      nearMisses.push(stock);
-    }
+    if (!stock.guardReasons.length) results.push(stock);
   }
 
-  return finalizeResults(results, nearMisses, allStocks);
+  return finalizeResults(results, [], allStocks);
 }
 
 // ═══════════════════════════════════════════
@@ -342,7 +370,6 @@ export function screenBTST(stocks: Map<string, StockData>): ScreenedStock[] {
 // ═══════════════════════════════════════════
 export function screenSwingBreakout(stocks: Map<string, StockData>): ScreenedStock[] {
   const results: ScreenedStock[] = [];
-  const nearMisses: ScreenedStock[] = [];
   const allStocks: ScreenedStock[] = [];
   const sectorBoosts = buildSectorBoosts(stocks);
 
@@ -358,14 +385,15 @@ export function screenSwingBreakout(stocks: Map<string, StockData>): ScreenedSto
     const ema20Arr = calcEMA(closes, 20);
     const ema50Arr = calcEMA(closes, 50);
     const macdArr = calcMACD(closes);
-    const ema200Arr = calcEMA(closes, Math.min(200, closes.length - 1));
+    const ema200Arr = calcEMA(closes, 200);
 
     const rsi = safeNum(rsiArr);
     const atr = safeNum(atrArr);
-    const rvol = computeRVOL(candles, volume, false);
+    const relativeVolume = stockRelativeVolume(data);
+    const rvol = relativeVolume?.value ?? 0;
     const ema20 = safeNum(ema20Arr);
     const ema50 = safeNum(ema50Arr);
-    const ema200 = safeNum(ema200Arr);
+    const ema200 = ema200Arr.at(-1) ?? null;
     const macdLast = macdArr.at(-1);
     const macdLine = macdLast?.MACD ?? 0;
     const macdSignal = macdLast?.signal ?? 0;
@@ -374,12 +402,13 @@ export function screenSwingBreakout(stocks: Map<string, StockData>): ScreenedSto
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
     const breakoutDaysAgo = findBreakoutDaysAgo(candles);
     const hh20 = highestHigh(highs, 20);
+    const retest = breakoutRetest(candles, atr);
 
     const lastCandle = candles.at(-1)!;
     const closingStrength = lastCandle.high !== lastCandle.low
       ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
       : 0.5;
-    const emaTrend = currentPrice > ema20 && ema20 > ema50 && ema50 > ema200 ? 1 :
+    const emaTrend = currentPrice > ema20 && ema20 > ema50 && (ema200 != null && ema50 > ema200) ? 1 :
       (currentPrice > ema50 ? 0 : -1);
     const quantScore = computeQuantScore({
       rsi, rvol, dayChangePct: dayChangePercent, macdBullish: macdLine > macdSignal,
@@ -388,36 +417,34 @@ export function screenSwingBreakout(stocks: Map<string, StockData>): ScreenedSto
 
     const stock: ScreenedStock = {
       symbol, name, sector: data.sector ?? "", cmp: currentPrice, dayChange: data.dayChange,
-      dayChangePercent, rsi, rvol, atr, ema20, ema50, ema200, macdLine, macdSignal,
+      dayChangePercent, rsi, rvol, relativeVolume, atr, ema20, ema50, ema200, macdLine, macdSignal,
       vwap, volume, quantScore, mode: "swing_breakout", fundamentals, candles,
-      defaultSL: currentPrice - 2 * atr,
+      defaultSL: retest ? Math.min(retest.bar.low,retest.level) - 0.25*atr : currentPrice - 2 * atr,
       target1: currentPrice + 4 * atr,
       target2: currentPrice + 6 * atr,
       ...extension,
       weeklyTrend,
       breakoutDaysAgo,
+      ...(retest?{breakoutLevel:retest.level}:{}),
       sectorBoost,
     };
 
+    stock.guardReasons = failedRules([
+      [currentPrice > ema20 && ema20 > ema50 && ema200 != null && ema50 > ema200, 'Bullish daily EMA20/50/200 stack unconfirmed'],
+      [currentPrice >= 0.97 * hh20, 'Price is more than 3% below its 20-bar high'],
+      [retest !== null, 'Completed breakout retest not confirmed'],
+      [!retest || (currentPrice >= retest.level && currentPrice <= retest.level + atr), 'Price is outside the breakout retest zone'],
+      [weeklyTrend === 'BULLISH', 'Weekly bullish confirmation unavailable'],
+      [!extension.extensionWarning, 'Extended move — wait for a pullback'],
+      [rvol >= 1.3, 'Swing breakout RVOL below 1.3× or baseline unavailable'],
+      [rsi >= 52 && rsi <= 75, 'Swing breakout RSI outside 52–75'],
+      [macdLine > macdSignal, 'Daily MACD is at or below its signal line']
+    ]);
     allStocks.push(stock);
-
-    const passesAllFilters =
-      currentPrice > ema20 && ema20 > ema50 && ema50 > ema200 &&   // EMA stack
-      currentPrice >= 0.97 * hh20 &&                                // Near 20-day high
-      breakoutDaysAgo !== null &&                                  // Breakout today or within last 3 sessions
-      weeklyTrend !== "BEARISH" &&                                 // Weekly confirmation
-      !extension.extensionWarning &&                               // Do not chase extended moves
-      rvol >= 1.3 &&                                                 // Above avg volume
-      rsi >= 52 && rsi <= 75 &&
-      macdLine > macdSignal;
-
-    if (passesAllFilters) results.push(stock);
-    else if (currentPrice > ema20 && ema20 > ema50 && rsi >= 48) {
-      nearMisses.push(stock);
-    }
+    if (!stock.guardReasons.length) results.push(stock);
   }
 
-  return finalizeResults(results, nearMisses, allStocks);
+  return finalizeResults(results, [], allStocks);
 }
 
 // ═══════════════════════════════════════════
@@ -425,7 +452,6 @@ export function screenSwingBreakout(stocks: Map<string, StockData>): ScreenedSto
 // ═══════════════════════════════════════════
 export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedStock[] {
   const results: ScreenedStock[] = [];
-  const nearMisses: ScreenedStock[] = [];
   const allStocks: ScreenedStock[] = [];
   const sectorBoosts = buildSectorBoosts(stocks);
 
@@ -440,14 +466,15 @@ export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedSto
     const ema20Arr = calcEMA(closes, 20);
     const ema50Arr = calcEMA(closes, 50);
     const macdArr = calcMACD(closes);
-    const ema200Arr = calcEMA(closes, Math.min(200, closes.length - 1));
+    const ema200Arr = calcEMA(closes, 200);
 
     const rsi = safeNum(rsiArr);
     const atr = safeNum(atrArr);
-    const rvol = computeRVOL(candles, volume, false);
+    const relativeVolume = stockRelativeVolume(data);
+    const rvol = relativeVolume?.value ?? 0;
     const ema20 = safeNum(ema20Arr);
     const ema50 = safeNum(ema50Arr);
-    const ema200 = safeNum(ema200Arr);
+    const ema200 = ema200Arr.at(-1) ?? null;
     const macdLast = macdArr.at(-1);
     const macdLine = macdLast?.MACD ?? 0;
     const macdSignal = macdLast?.signal ?? 0;
@@ -458,11 +485,11 @@ export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedSto
 
     const lastCandle = candles.at(-1)!;
     const distFromEma20 = ema20 > 0 ? Math.abs(currentPrice - ema20) / ema20 : 1;
-    const isBullishCandle = lastCandle.close > lastCandle.open;
+    const reversal=confirmDailyReversal(candles,20,atr);
     const closingStrength = lastCandle.high !== lastCandle.low
       ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
       : 0.5;
-    const emaTrend = ema20 > ema50 && ema50 > ema200 ? 1 : (ema20 > ema50 ? 0 : -1);
+    const emaTrend = ema20 > ema50 && (ema200 != null && ema50 > ema200) ? 1 : (ema20 > ema50 ? 0 : -1);
     const quantScore = computeQuantScore({
       rsi, rvol, dayChangePct: dayChangePercent, macdBullish: macdLine > macdSignal,
       emaTrend, fundamentalScore: 0, closingStrength, sectorBoost,
@@ -470,7 +497,7 @@ export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedSto
 
     const stock: ScreenedStock = {
       symbol, name, sector: data.sector ?? "", cmp: currentPrice, dayChange: data.dayChange,
-      dayChangePercent, rsi, rvol, atr, ema20, ema50, ema200, macdLine, macdSignal,
+      dayChangePercent, rsi, rvol, relativeVolume, atr, ema20, ema50, ema200, macdLine, macdSignal,
       vwap, volume, quantScore, mode: "swing_pullback", fundamentals, candles,
       defaultSL: currentPrice - 2 * atr,
       target1: currentPrice + 4 * atr,
@@ -479,25 +506,23 @@ export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedSto
       weeklyTrend,
       breakoutDaysAgo,
       sectorBoost,
+      ...(reversal?{entryConfirmationAt:reversal.at}:{}),
     };
 
+    stock.guardReasons = failedRules([
+      [ema20 > ema50 && ema200 != null && ema50 > ema200, 'Bullish daily EMA20/50/200 stack unconfirmed'],
+      [weeklyTrend === 'BULLISH', 'Weekly bullish confirmation unavailable'],
+      [!extension.extensionWarning, 'Extended move — wait for a pullback'],
+      [distFromEma20 <= 0.03, 'Price is outside the 3% EMA20 pullback area'],
+      [rsi >= 42 && rsi <= 62, 'Swing pullback RSI outside 42–62'],
+      [reversal !== null, 'Completed daily EMA20 reversal not confirmed'],
+      [!reversal || currentPrice >= reversal.level - 0.25 * atr, 'Price fell below the EMA20 reversal area']
+    ]);
     allStocks.push(stock);
-
-    const passesAllFilters =
-      ema20 > ema50 && ema50 > ema200 &&
-      weeklyTrend !== "BEARISH" &&
-      !extension.extensionWarning &&
-      distFromEma20 <= 0.03 &&
-      rsi >= 42 && rsi <= 62 &&
-      isBullishCandle;
-
-    if (passesAllFilters) results.push(stock);
-    else if (ema20 > ema50 && distFromEma20 <= 0.08 && rsi >= 38) {
-      nearMisses.push(stock);
-    }
+    if (!stock.guardReasons.length) results.push(stock);
   }
 
-  return finalizeResults(results, nearMisses, allStocks);
+  return finalizeResults(results, [], allStocks);
 }
 
 // ═══════════════════════════════════════════
@@ -505,7 +530,6 @@ export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedSto
 // ═══════════════════════════════════════════
 export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[] {
   const results: ScreenedStock[] = [];
-  const nearMisses: ScreenedStock[] = [];
   const allStocks: ScreenedStock[] = [];
   const sectorBoosts = buildSectorBoosts(stocks);
 
@@ -518,16 +542,17 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
     const rsiArr = calcRSI(closes);
     const atrArr = calcATR(candles);
     const ema50Arr = calcEMA(closes, 50);
-    const ema200Arr = calcEMA(closes, Math.min(200, closes.length - 1));
+    const ema200Arr = calcEMA(closes, 200);
     const macdArr = calcMACD(closes);
     const ema20Arr = calcEMA(closes, 20);
 
     const rsi = safeNum(rsiArr);
     const atr = safeNum(atrArr);
-    const rvol = computeRVOL(candles, volume, false);
+    const relativeVolume = stockRelativeVolume(data);
+    const rvol = relativeVolume?.value ?? 0;
     const ema20 = safeNum(ema20Arr);
     const ema50 = safeNum(ema50Arr);
-    const ema200 = safeNum(ema200Arr);
+    const ema200 = ema200Arr.at(-1) ?? null;
     const macdLast = macdArr.at(-1);
     const macdLine = macdLast?.MACD ?? 0;
     const macdSignal = macdLast?.signal ?? 0;
@@ -535,6 +560,7 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
     const breakoutDaysAgo = findBreakoutDaysAgo(candles);
+    const reversal=confirmDailyReversal(candles,50,atr);
 
     const fg = fundamentals;
     const fundamentalsAvailable = [
@@ -550,13 +576,6 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
       ? (fg.returnOnEquity ?? 0) >= 0.12 && (fg.revenueGrowth ?? 0) >= 0.10
       : false;
 
-    const passesAllFilters =
-      currentPrice > ema50 && ema50 > ema200 &&
-      rsi >= 52 &&
-      weeklyTrend === "BULLISH" &&
-      !extension.extensionWarning &&
-      fundaOk;
-
     const lastCandle = candles.at(-1)!;
     const closingStrength = lastCandle.high !== lastCandle.low
       ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
@@ -567,7 +586,7 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
     if ((fg.revenueGrowth ?? 0) >= 0.10) fundamentalScore += 10;
     if ((fg.earningsGrowth ?? 0) >= 0.12) fundamentalScore += 10;
 
-    const emaTrend = currentPrice > ema50 && ema50 > ema200 ? 1 : (currentPrice > ema200 ? 0 : -1);
+    const emaTrend = currentPrice > ema50 && (ema200 != null && ema50 > ema200) ? 1 : ((ema200 != null && currentPrice > ema200) ? 0 : -1);
     const quantScore = computeQuantScore({
       rsi, rvol, dayChangePct: dayChangePercent, macdBullish: macdLine > macdSignal,
       emaTrend, fundamentalScore, closingStrength, sectorBoost,
@@ -575,7 +594,7 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
 
     const stock: ScreenedStock = {
       symbol, name, sector: data.sector ?? "", cmp: currentPrice, dayChange: data.dayChange,
-      dayChangePercent, rsi, rvol, atr, ema20, ema50, ema200, macdLine, macdSignal,
+      dayChangePercent, rsi, rvol, relativeVolume, atr, ema20, ema50, ema200, macdLine, macdSignal,
       vwap, volume, quantScore, mode: "positional", fundamentals, candles,
       defaultSL: currentPrice - 2 * atr,
       target1: currentPrice + 5 * atr,
@@ -584,17 +603,22 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
       weeklyTrend,
       breakoutDaysAgo,
       sectorBoost,
+      ...(reversal?{entryConfirmationAt:reversal.at}:{}),
     };
 
+    stock.guardReasons = failedRules([
+      [reversal !== null, 'Completed daily EMA50 reversal not confirmed'],
+      [currentPrice > ema50 && ema200 != null && ema50 > ema200, 'Price and EMA50 must be above the long-term trend floor'],
+      [rsi >= 52, 'Daily RSI below 52'],
+      [weeklyTrend === 'BULLISH', 'Weekly bullish confirmation unavailable'],
+      [!extension.extensionWarning, 'Extended move — wait for a pullback'],
+      [fundaOk, 'Positional setup requires reported ROE ≥12% and revenue growth ≥10%']
+    ]);
     allStocks.push(stock);
-
-    if (passesAllFilters) results.push(stock);
-    else if (currentPrice > ema50 && rsi >= 45) {
-      nearMisses.push(stock);
-    }
+    if (!stock.guardReasons.length) results.push(stock);
   }
 
-  return finalizeResults(results, nearMisses, allStocks);
+  return finalizeResults(results, [], allStocks);
 }
 
 // ═══════════════════════════════════════════
@@ -602,7 +626,6 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
 // ═══════════════════════════════════════════
 export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] {
   const results: ScreenedStock[] = [];
-  const nearMisses: ScreenedStock[] = [];
   const allStocks: ScreenedStock[] = [];
   const sectorBoosts = buildSectorBoosts(stocks);
 
@@ -614,17 +637,18 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
     const closes = candles.map((c) => c.close);
     const rsiArr = calcRSI(closes);
     const atrArr = calcATR(candles);
-    const ema200Arr = calcEMA(closes, Math.min(200, closes.length - 1));
+    const ema200Arr = calcEMA(closes, 200);
     const ema50Arr = calcEMA(closes, 50);
     const ema20Arr = calcEMA(closes, 20);
     const macdArr = calcMACD(closes);
 
     const rsi = safeNum(rsiArr);
     const atr = safeNum(atrArr);
-    const rvol = computeRVOL(candles, volume, false);
+    const relativeVolume = stockRelativeVolume(data);
+    const rvol = relativeVolume?.value ?? 0;
     const ema20 = safeNum(ema20Arr);
     const ema50 = safeNum(ema50Arr);
-    const ema200 = safeNum(ema200Arr);
+    const ema200 = ema200Arr.at(-1) ?? null;
     const macdLast = macdArr.at(-1);
     const macdLine = macdLast?.MACD ?? 0;
     const macdSignal = macdLast?.signal ?? 0;
@@ -634,7 +658,7 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
     const breakoutDaysAgo = findBreakoutDaysAgo(candles);
 
     const fg = fundamentals;
-    // Quality score — allow if any fundamentals look good
+    // Quality score for companies with reported fundamentals.
     const roe = fg.returnOnEquity ?? 0;
     const de = fg.debtToEquity ?? 100;
     const revGrowth = fg.revenueGrowth ?? 0;
@@ -651,14 +675,6 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
     ].some((value) => value !== null);
     const fundaOk = fundamentalsAvailable && roe >= 0.12;
 
-    const passesAllFilters =
-      currentPrice > ema200 &&
-      fundaOk &&
-      weeklyTrend !== "BEARISH" &&
-      !extension.extensionWarning &&
-      (de <= 100 || fg.debtToEquity === null) && // relaxed D/E since Yahoo gives weird values
-      rsi >= 45;
-
     const lastCandle = candles.at(-1)!;
     const closingStrength = lastCandle.high !== lastCandle.low
       ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
@@ -671,7 +687,7 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
     if (revGrowth >= 0.10) fundamentalScore += 5;
     if (margins >= 0.08) fundamentalScore += 5;
 
-    const emaTrend = currentPrice > ema200 ? 1 : -1;
+    const emaTrend = (ema200 != null && currentPrice > ema200) ? 1 : -1;
     const quantScore = computeQuantScore({
       rsi, rvol, dayChangePct: dayChangePercent, macdBullish: macdLine > macdSignal,
       emaTrend, fundamentalScore, closingStrength, sectorBoost,
@@ -679,7 +695,7 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
 
     const stock: ScreenedStock = {
       symbol, name, sector: data.sector ?? "", cmp: currentPrice, dayChange: data.dayChange,
-      dayChangePercent, rsi, rvol, atr, ema20, ema50, ema200, macdLine, macdSignal,
+      dayChangePercent, rsi, rvol, relativeVolume, atr, ema20, ema50, ema200, macdLine, macdSignal,
       vwap, volume, quantScore, mode: "longterm", fundamentals, candles,
       defaultSL: currentPrice * 0.92,
       target1: currentPrice * 1.20,
@@ -690,25 +706,29 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
       sectorBoost,
     };
 
+    stock.guardReasons = failedRules([
+      [ema200 != null && currentPrice > ema200, 'Price above daily EMA200 unconfirmed'],
+      [fundaOk, 'Long-term shortlist requires reported ROE ≥12%'],
+      [weeklyTrend === 'BULLISH', 'Weekly bullish confirmation unavailable'],
+      [!extension.extensionWarning, 'Extended move — wait for a pullback'],
+      [fg.debtToEquity != null && de <= 100, 'Reported debt-to-equity above 1× or unavailable'],
+      [rsi >= 45, 'Daily RSI below 45']
+    ]);
     allStocks.push(stock);
-
-    if (passesAllFilters) results.push(stock);
-    else if (currentPrice > ema200) {
-      nearMisses.push(stock);
-    }
+    if (!stock.guardReasons.length) results.push(stock);
   }
 
-  return finalizeResults(results, nearMisses, allStocks);
+  return finalizeResults(results, [], allStocks);
 }
 
 export function runScreener(mode: ScreenerMode, stocks: Map<string, StockData>): ScreenedStock[] {
-  switch (mode) {
-    case "intraday":        return screenIntraday(stocks);
-    case "btst":            return screenBTST(stocks);
-    case "swing_breakout":  return screenSwingBreakout(stocks);
-    case "swing_pullback":  return screenSwingPullback(stocks);
-    case "positional":      return screenPositional(stocks);
-    case "longterm":        return screenLongTerm(stocks);
-    default:                return [];
-  }
+  const engines = { intraday: screenIntraday, btst: screenBTST, swing_breakout: screenSwingBreakout, swing_pullback: screenSwingPullback, positional: screenPositional, longterm: screenLongTerm };
+  const engine = engines[mode];
+  if (!engine) return [];
+  return engine(stocks).map(stock => {
+    const data = stocks.get(stock.symbol)!;
+    const reasons = [...(stock.guardReasons ?? [])];
+    if (!['intraday', 'btst'].includes(mode) && stock.ema200 == null) reasons.push('EMA200 requires at least 200 candles; history is insufficient');
+    return { ...stock, sectorBenchmark:data.sectorBenchmark, dataQuality: data.dataQuality, guardReasons: reasons };
+  });
 }

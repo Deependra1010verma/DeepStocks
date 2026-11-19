@@ -1,46 +1,34 @@
-import { NextRequest, NextResponse } from "next/server";
-import { connectDB } from "@/lib/db";
-import { SignalLedger, SignalStatus } from "@/lib/models/SignalLedger";
-import { todayIST } from "@/lib/timezone";
-
-export const dynamic = "force-dynamic";
-
+import { NextRequest, NextResponse } from 'next/server';
+import { connectDB } from '@/lib/db';
+import { SignalLedger } from '@/lib/models/SignalLedger';
+import { requireOwner, authorizeRequest, apiError, readBody } from '@/lib/apiSecurity';
+import { validMode, validSymbol, resolveStock } from '@/lib/stockService';
+import { recordPaperSignal } from '@/lib/ledgerService';
+import { summarizePaperSignals, PAPER_EVALUATION_VERSION, type PaperSignal } from '@/lib/ledgerEngine';
+import { AppError } from '@/lib/operations';
+import { STRATEGY_VERSION } from '@/lib/strategyPolicy';
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 export async function GET(req: NextRequest) {
-  try {
-    await connectDB();
-    const status = req.nextUrl.searchParams.get("status");
-    const query = status ? { status } : {};
-    const items = await SignalLedger.find(query).sort({ signalDate: -1 }).limit(200).lean();
-    const closed = items.filter((item) => item.status !== "OPEN");
-    const wins = closed.filter((item) => item.status === "TARGET1" || item.status === "TARGET2").length;
-    return NextResponse.json({ items, stats: { closed: closed.length, wins, winRate: closed.length ? wins / closed.length : null } });
-  } catch (error) {
-    return NextResponse.json({ error: "Signal ledger unavailable", details: String(error) }, { status: 503 });
-  }
+ try {
+  requireOwner(req);await connectDB();
+  const mode=req.nextUrl.searchParams.get('mode'); const query=mode?{mode:validMode(mode)}:{};
+  const items=await SignalLedger.find(query).sort({signalDate:-1}).limit(500).lean();
+  const closed=await SignalLedger.find({...query,evaluationVersion:PAPER_EVALUATION_VERSION,closedAt:{$exists:true}}).sort({closedAt:1}).limit(10000).lean();
+  const summarize=(list:typeof closed)=>summarizePaperSignals(list as Array<PaperSignal & {evaluationVersion?:number}>);
+  const stats=summarize(closed);
+  const currentRvol=closed.filter(s=>s.strategyVersion===STRATEGY_VERSION);
+  const byRvol={high:summarize(currentRvol.filter(s=>s.rvolAtEntry!=null&&s.rvolAtEntry>=1.8)),low:summarize(currentRvol.filter(s=>s.rvolAtEntry!=null&&s.rvolAtEntry<1.8))};
+  const bySector=[...new Set(closed.map(s=>s.sector??'Unknown'))].map(sector=>({sector,...summarize(closed.filter(s=>(s.sector??'Unknown')===sector))}));
+  const byStrategyVersion=[...new Set(closed.map(s=>s.strategyVersion??'prior'))].map(version=>({version,...summarize(closed.filter(s=>(s.strategyVersion??'prior')===version))}));
+  return NextResponse.json({items,stats:{...stats,byRvol,bySector,byStrategyVersion},historyCapped:closed.length===10000,unavailable:false},{headers:{'Cache-Control':'no-store'}});
+ }catch(e){return apiError(e);}
 }
-
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    if (!body.symbol || !body.mode) return NextResponse.json({ error: "Symbol and mode required" }, { status: 400 });
-    await connectDB();
-    const item = await SignalLedger.findOneAndUpdate(
-      { symbol: String(body.symbol).toUpperCase(), mode: body.mode, signalDate: body.signalDate ?? todayIST() },
-      {
-        $set: {
-          entry: Number(body.entry),
-          stopLoss: Number(body.stopLoss),
-          target1: Number(body.target1),
-          target2: Number(body.target2),
-          quantScore: Number(body.quantScore),
-          status: (body.status ?? "OPEN") as SignalStatus,
-          updatedAt: new Date(),
-        },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    ).lean();
-    return NextResponse.json({ item });
-  } catch (error) {
-    return NextResponse.json({ error: "Could not write signal ledger", details: String(error) }, { status: 503 });
-  }
+ try {
+  await authorizeRequest(req,'ledger',10);const body=await readBody(req);
+  if(Object.keys(body).some(k=>!['symbol','mode'].includes(k)))throw new AppError('INVALID_REQUEST','Paper signals use server-computed levels only.',400);
+  const stock=await resolveStock(validSymbol(body.symbol),validMode(body.mode));await connectDB();
+  return NextResponse.json({item:await recordPaperSignal(stock)});
+ }catch(e){return apiError(e);}
 }

@@ -1,11 +1,15 @@
 "use client";
 import { ScreenedStock } from "@/lib/screenerEngine";
+import type { RemovedScanStock } from "@/lib/models/ScanSnapshot";
 
 interface Props {
   stocks: ScreenedStock[];
+  removedToday: RemovedScanStock[];
   selected: ScreenedStock | null;
   onSelect: (stock: ScreenedStock) => void;
   loading: boolean;
+  emptyTitle?: string;
+  emptyMessage?: string;
 }
 
 const RANK_STYLES = [
@@ -26,22 +30,19 @@ function MiniBar({ value, max, color }: { value: number; max: number; color: str
   );
 }
 
-function RvolChip({ rvol }: { rvol: number }) {
+function RvolChip({ stock }: { stock: ScreenedStock }) {
+  const { rvol, relativeVolume } = stock;
+  if (relativeVolume == null) return (
+    <span title={relativeVolume === null ? 'Comparable volume history unavailable' : 'Refresh this snapshot to measure RVOL'} className="text-[10px] font-mono text-slate-500">RVOL —</span>
+  );
   const hot = rvol >= 2.5;
   const warm = rvol >= 1.8;
-  if (hot) return (
-    <span className="inline-flex items-center gap-0.5 text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-700 text-emerald-400">
-      🔥 {rvol.toFixed(1)}x
-    </span>
-  );
-  if (warm) return (
-    <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-950 border border-cyan-800 text-cyan-400">
-      {rvol.toFixed(1)}x
-    </span>
-  );
+  const color = hot ? 'bg-emerald-950 border-emerald-700 text-emerald-400 font-bold'
+    : warm ? 'bg-cyan-950 border-cyan-800 text-cyan-400 font-bold' : 'bg-slate-800 border-slate-700 text-slate-500';
+  const basis = relativeVolume.kind === 'intraday-cumulative' ? 'Same-time cumulative RVOL' : 'Daily RVOL';
   return (
-    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-500">
-      {rvol.toFixed(1)}x
+    <span title={basis} className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${color}`}>
+      {hot ? '🔥 ' : ''}{rvol.toFixed(2)}×
     </span>
   );
 }
@@ -69,8 +70,8 @@ function SkeletonCard() {
   );
 }
 
-export default function StockList({ stocks, selected, onSelect, loading }: Props) {
-  if (loading) {
+export default function StockList({ stocks, removedToday, selected, onSelect, loading, emptyTitle = 'No matching setups', emptyMessage = 'No setups matched this strategy in the available scan data.' }: Props) {
+  if (loading && stocks.length === 0) {
     return (
       <div className="flex flex-col gap-2 p-3">
         {Array.from({ length: 6 }).map((_, i) => (
@@ -89,22 +90,23 @@ export default function StockList({ stocks, selected, onSelect, loading }: Props
               d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
           </svg>
         </div>
-        <p className="text-sm font-semibold text-slate-300">Your shortlist is waiting</p>
-        <p className="mt-1 max-w-[190px] text-xs leading-5 text-slate-600">Choose a strategy and run a scan to surface the strongest setups.</p>
+        <p className="text-sm font-semibold text-slate-300">{emptyTitle}</p>
+        <p className="mt-1 max-w-[190px] text-xs leading-5 text-slate-400">{emptyMessage}</p>
       </div>
     );
   }
 
-  const qualified = stocks.filter(s => !s.nearMiss);
-  const nearMiss  = stocks.filter(s =>  s.nearMiss);
+  const qualified = stocks.filter(s => !s.nearMiss || s.researchQualified);
+  const nearMiss = stocks.filter(s => s.nearMiss && !s.researchQualified);
 
   return (
     <div className="flex flex-col">
       {qualified.length > 0 && (
         <div className="p-3 flex flex-col gap-2">
+          {qualified.some(stock=>stock.researchQualified)&&<p className="px-1 text-[10px] font-semibold uppercase tracking-widest text-cyan-300">Research shortlist · manual review</p>}
           {qualified.map((stock, i) => {
             const isSelected = selected?.symbol === stock.symbol;
-            const isTop3 = i < 3;
+            const isTop3 = i < 3 && !stock.researchQualified;
             const changeUp = stock.dayChangePercent >= 0;
 
             return (
@@ -142,6 +144,16 @@ export default function StockList({ stocks, selected, onSelect, loading }: Props
                           <span className="font-bold text-sm text-white tracking-wide">
                             {stock.symbol.replace(".NS", "")}
                           </span>
+                          {stock.lifecycleState === "NEW" && (
+                            <span className="rounded border border-emerald-700/70 bg-emerald-950/70 px-1 py-0.5 text-[8px] font-black tracking-wide text-emerald-400">
+                              NEW
+                            </span>
+                          )}
+                          {stock.earningsRisk && (
+                            <span title="Earnings or corporate event within 5 trading days" className="rounded border border-red-800/70 bg-red-950/70 px-1 py-0.5 text-[8px] font-black tracking-wide text-red-300">
+                              EVENT
+                            </span>
+                          )}
                           {isSelected && (
                             <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
                           )}
@@ -184,7 +196,7 @@ export default function StockList({ stocks, selected, onSelect, loading }: Props
                         RSI {stock.rsi.toFixed(0)}
                       </span>
                       {/* RVOL */}
-                      <RvolChip rvol={stock.rvol} />
+                      <RvolChip stock={stock} />
                     </div>
 
                     {/* Score + Sector */}
@@ -203,6 +215,16 @@ export default function StockList({ stocks, selected, onSelect, loading }: Props
                   {stock.extensionWarning && (
                     <div className="mt-2 rounded-md border border-amber-900/60 bg-amber-950/30 px-2 py-1 text-[10px] font-medium text-amber-400">
                       Extended move · wait for pullback
+                    </div>
+                  )}
+                  {stock.liquidityWarning && (
+                    <div className="mt-2 rounded-md border border-red-900/60 bg-red-950/25 px-2 py-1 text-[10px] font-medium text-red-300">
+                      Liquidity guard · {stock.liquidityWarning}
+                    </div>
+                  )}
+                  {stock.sectorCluster && (
+                    <div className="mt-2 rounded-md border border-purple-900/60 bg-purple-950/25 px-2 py-1 text-[10px] font-medium text-purple-300">
+                      Sector cluster · pick top 1–2 only
                     </div>
                   )}
                 </div>
@@ -238,6 +260,10 @@ export default function StockList({ stocks, selected, onSelect, loading }: Props
                       <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-amber-950 border border-amber-800 text-amber-500">~</span>
                       <div>
                         <span className="font-semibold text-sm text-slate-300">{stock.symbol.replace(".NS", "")}</span>
+                        {stock.lifecycleState === "NEW" && (
+                          <span className="ml-1 rounded border border-emerald-800 bg-emerald-950/70 px-1 py-0.5 text-[8px] font-black text-emerald-400">NEW</span>
+                        )}
+                        {stock.earningsRisk && <span className="ml-1 rounded border border-red-800 bg-red-950/70 px-1 py-0.5 text-[8px] font-black text-red-300">EVENT</span>}
                         <div className="text-[11px] text-slate-600 truncate max-w-[120px]">{stock.name}</div>
                       </div>
                     </div>
@@ -251,9 +277,31 @@ export default function StockList({ stocks, selected, onSelect, loading }: Props
                   {stock.extensionWarning && (
                     <div className="mt-2 text-[10px] text-amber-500">Extended move · do not chase</div>
                   )}
+                  {stock.sectorCluster && <div className="mt-2 text-[10px] text-purple-400">Sector cluster · pick top 1–2 only</div>}
+                  {stock.liquidityWarning && <div className="mt-2 text-[10px] text-red-300">Liquidity guard · {stock.liquidityWarning}</div>}
                 </button>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {removedToday.length > 0 && (
+        <div className="border-t border-slate-800/70 px-3 pb-3 pt-2">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-[10px] font-medium uppercase tracking-widest text-slate-600">Removed Today</span>
+            <span className="rounded-full border border-slate-800 bg-slate-900 px-1.5 py-0.5 text-[10px] font-mono text-slate-500">{removedToday.length}</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {removedToday.slice(0, 8).map((item) => (
+              <div key={`${item.symbol}-${new Date(item.removedAt).getTime()}`} className="rounded-lg border border-slate-800/60 bg-slate-950/40 px-2.5 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-slate-400">{item.symbol.replace(".NS", "")}</span>
+                  <span className="text-[10px] font-mono text-slate-600">{item.quantScore}</span>
+                </div>
+                <div className="mt-1 text-[10px] leading-4 text-slate-600">{item.reason}</div>
+              </div>
+            ))}
           </div>
         </div>
       )}

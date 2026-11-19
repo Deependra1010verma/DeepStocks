@@ -7,7 +7,7 @@ const ai = new GoogleGenAI({ apiKey });
 
 try {
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: process.env.GEMINI_MODEL ?? "gemini-3.8-flash",
     contents: [{ role: "user", parts: [{ text: "Say hello in one line." }] }],
   });
   console.log("✅ Gemini works:", response.text);

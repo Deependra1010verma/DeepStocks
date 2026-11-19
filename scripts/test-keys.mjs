@@ -14,7 +14,8 @@ for (const line of envText.split("\n")) {
 console.log(`Testing ${keys.length} keys...\n`);
 
 async function testKey({ index, key }) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
+  const model = process.env.GEMINI_MODEL ?? "gemini-3.8-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
   const body = JSON.stringify({
     contents: [{ role: "user", parts: [{ text: "Say OK" }] }],
     generationConfig: { maxOutputTokens: 5 },

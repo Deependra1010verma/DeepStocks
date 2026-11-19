@@ -7,6 +7,7 @@ import {
   CrosshairMode,
   CandlestickSeries,
   LineSeries,
+  LineStyle,
   TickMarkType,
   Time,
 } from "lightweight-charts";
@@ -18,6 +19,10 @@ interface Props {
   ema50: number;
   ema200: number;
   symbol: string;
+  entryPrice?: number;
+  stopLoss?: number;
+  target1?: number;
+  target2?: number;
 }
 
 function computeEMA(closes: number[], period: number): { idx: number; value: number }[] {
@@ -56,7 +61,7 @@ function formatIST(date: Date, withTime: boolean): string {
   }).format(date);
 }
 
-export default function CandlestickChart({ candles, symbol }: Props) {
+export default function CandlestickChart({ candles, symbol, entryPrice, stopLoss, target1, target2 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const timestamps = candles
@@ -199,6 +204,21 @@ export default function CandlestickChart({ candles, symbol }: Props) {
     addEMASeries(50, "#f59e0b", "EMA50");
     if (allCloses.length >= 200) addEMASeries(200, "#a855f7", "EMA200");
 
+    const priceLines = [
+      entryPrice != null && { price: entryPrice, color: "#38bdf8", title: "Entry", lineStyle: LineStyle.Solid },
+      stopLoss != null && { price: stopLoss, color: "#ef4444", title: "SL", lineStyle: LineStyle.Dashed },
+      target1 != null && { price: target1, color: "#10b981", title: "T1", lineStyle: LineStyle.Dashed },
+      target2 != null && { price: target2, color: "#34d399", title: "T2", lineStyle: LineStyle.Dashed },
+    ].filter(Boolean) as Array<{ price: number; color: string; title: string; lineStyle: LineStyle }>;
+    priceLines.forEach((line) => candleSeries.createPriceLine({
+      price: line.price,
+      color: line.color,
+      lineWidth: 1,
+      lineStyle: line.lineStyle,
+      axisLabelVisible: true,
+      title: line.title,
+    }));
+
     chart.timeScale().fitContent();
 
     const handleResize = () => {
@@ -218,7 +238,7 @@ export default function CandlestickChart({ candles, symbol }: Props) {
         chartRef.current = null;
       }
     };
-  }, [candles, symbol]);
+  }, [candles, entryPrice, stopLoss, symbol, target1, target2]);
 
   if (candles.length === 0) {
     return (

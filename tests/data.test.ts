@@ -1,0 +1,18 @@
+import { it,expect,vi,afterEach } from 'vitest';
+const yahoo=vi.hoisted(()=>({chart:vi.fn(),quote:vi.fn(),quoteSummary:vi.fn(),fundamentalsTimeSeries:vi.fn()}));
+vi.mock('yahoo-finance2',()=>({default:class{chart=yahoo.chart;quote=yahoo.quote;quoteSummary=yahoo.quoteSummary;fundamentalsTimeSeries=yahoo.fundamentalsTimeSeries;}}));
+vi.mock('../src/lib/db',()=>({connectDB:vi.fn().mockRejectedValue(new Error('isolated: no DB'))}));
+vi.mock('../src/lib/nseSessionData',()=>({getCashSession:async()=>new Map(),getIndexSession:async()=>new Map(),restoreCashSpecialSessions:async(_:string,bars:unknown[])=>bars}));
+import { parseCalendarEvents,fetchHistoricalCandles,type StockData } from '../src/lib/dataFetcher';
+import { turnover,circuitLockedInLastFive,applyInstitutionalGuards } from '../src/lib/riskGuards';
+import { getMarketRegime,type MarketRegimeSnapshot } from '../src/lib/marketRegime';
+import { stock,bar,NOW } from './fixtures';
+afterEach(()=>vi.useRealTimers());
+it('parses actual nested Yahoo earningsDate schema',()=>{vi.useFakeTimers();vi.setSystemTime(NOW);const event=parseCalendarEvents({calendarEvents:{earnings:{earningsDate:[new Date('2026-11-20T00:00:00Z')]}}});expect(event.earningsDate).toBe('2026-11-20T00:00:00.000Z');expect(event.eventStatus).toBe('known');});
+it('missing event data stays unknown',()=>expect(parseCalendarEvents({}).eventStatus).toBe('unknown'));
+it('a short candle request cannot poison a longer history request',async()=>{yahoo.chart.mockImplementation(async(_symbol,query)=>({quotes:Array.from({length:query.period1.getUTCMonth()===10?7:250},(_,i)=>bar(new Date(Date.UTC(2026,0,i+1)).toISOString()))}));const short=await fetchHistoricalCandles('RANGE.NS','1d',new Date('2026-11-01'));const long=await fetchHistoricalCandles('RANGE.NS','1d',new Date('2026-01-01'));expect(short).toHaveLength(7);expect(long).toHaveLength(250);});
+it('identical concurrent candle requests share one provider call',async()=>{yahoo.chart.mockClear();yahoo.chart.mockResolvedValue({quotes:[bar('2026-11-18')]});const from=new Date('2026-11-01');await Promise.all([fetchHistoricalCandles('DEDUPE.NS','1d',from),fetchHistoricalCandles('DEDUPE.NS','1d',from)]);expect(yahoo.chart).toHaveBeenCalledTimes(1);});
+it('three daily bars cannot pass a twenty-session liquidity gate',()=>{const s=stock();expect(turnover(s,{...s,candles:s.candles.slice(0,3)} as unknown as StockData)).toBeNull();});
+it('flat circuit-like gap is detected against previous close',()=>expect(circuitLockedInLastFive({candles:[bar('2026-11-17',100),bar('2026-11-18',105)]} as StockData)).toBe(true));
+it('unknown Nifty/VIX blocks new position risk',async()=>{yahoo.quote.mockResolvedValue(null);yahoo.chart.mockResolvedValue({quotes:[]});const regime=await getMarketRegime();expect(regime.available).toBe(false);expect(regime.positionRiskPercent).toBe(0);});
+it('three stocks in one sector remain visible but only two get primary rank',async()=>{vi.useFakeTimers();vi.setSystemTime(NOW);const stocks=[1,2,3].map(i=>stock({symbol:`SECTOR${i}.NS`,breakoutDaysAgo:1,target1:1110,target2:1160,fundamentals:{...stock().fundamentals,eventStatus:'known',earningsDate:'2026-12-20T00:00:00Z'}}));const data=new Map(stocks.map(s=>[s.symbol,{...s,candles:s.candles.map(c=>({...c,volume:1e7}))} as unknown as StockData]));const regime={available:true,regime:'NEUTRAL',defensiveMode:false,positionRiskPercent:1,riskMultiplier:1,reason:'fixture'} as MarketRegimeSnapshot;const result=await applyInstitutionalGuards('swing_breakout',stocks,data,regime);expect(result.filter(s=>!s.nearMiss)).toHaveLength(3);expect(result.filter(s=>s.primaryRank)).toHaveLength(2);expect(result.every(s=>s.sectorCluster)).toBe(true);});

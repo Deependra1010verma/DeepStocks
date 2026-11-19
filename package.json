@@ -6,7 +6,12 @@
     "dev": "next dev",
     "build": "next build --webpack",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "check": "npm run lint && tsc --noEmit && npm test",
+    "db:indexes": "node --env-file=.env.local scripts/ensure-indexes.mjs",
+    "benchmark:ai": "RUN_PROVIDER_BENCHMARK=1 node --env-file=.env.local node_modules/vitest/vitest.mjs run --config vitest.live.config.mts tests/live/provider.test.ts"
   },
   "dependencies": {
     "@google/genai": "^3.2.0",
@@ -21,14 +26,16 @@
     "yahoo-finance2": "^4.0.6"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@tailwindcss/postcss": "^4.3.3",
     "@tailwindcss/turbopack": "4.3.3",
-    "@types/node": "^20",
+    "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.4.6",
     "tailwindcss": "4.3.3",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^5.1.0"
   }
 }

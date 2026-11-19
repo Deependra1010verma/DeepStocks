@@ -36,6 +36,7 @@ function buildAlertMessage(payload: TelegramAlertPayload): string {
     positional: "📊",
     longterm: "💎",
     watchlist: "🔔",
+    "preopen-gap": "🚨",
   };
 
   const regimeEmoji =
@@ -49,9 +50,10 @@ function buildAlertMessage(payload: TelegramAlertPayload): string {
     positional: "POSITIONAL",
     longterm: "LONG-TERM",
     watchlist: "WATCHLIST ZONE",
+    "preopen-gap": "PRE-OPEN GAP — SKIP CHASING",
   };
 
-  let msg = `${modeEmoji[mode] ?? "📈"} *DeepStocks AI Scanner*\n`;
+  let msg = `${modeEmoji[mode] ?? "📈"} *DeepStocks Research*\n`;
   msg += `*Mode:* ${modeLabel[mode] ?? mode.toUpperCase()}\n`;
   msg += `*Market:* ${regimeEmoji} Nifty ${marketRegime}\n`;
   msg += `*Time:* ${timestamp}\n`;
@@ -67,10 +69,15 @@ function buildAlertMessage(payload: TelegramAlertPayload): string {
     const ticker = s.symbol.replace(".NS", "");
     msg += `*${i + 1}. ${ticker}* — ₹${formatNumber(s.cmp, 0)}\n`;
     msg += `   ${changeEmoji} ${s.dayChangePercent >= 0 ? "+" : ""}${formatNumber(s.dayChangePercent)}% | RSI: ${formatNumber(s.rsi, 0)} | RVOL: ${formatNumber(s.rvol, 1)}x\n`;
-    msg += `   📌 Score: ${s.quantScore}/100 | SL: ₹${formatNumber(s.defaultSL, 0)} | T1: ₹${formatNumber(s.target1, 0)}\n\n`;
+    if (mode !== 'preopen-gap') msg += `   📌 Score: ${s.quantScore}/100 | SL: ₹${formatNumber(s.defaultSL, 2)} | T1: ₹${formatNumber(s.target1, 2)}\n\n`;
   });
 
+  if (mode === "preopen-gap") {
+    msg += `⚠️ *Indicative auction price above entry zone — skip chasing. Final opening price unverified.*\n`;
+  }
+
   msg += `━━━━━━━━━━━━━━━━━━\n`;
+  msg += `Delayed research feed. Verify current broker quotes; this is not an execution instruction.\n`;
   msg += `🔗 [Open DeepStocks Dashboard](${getAppUrl()})`;
 
   return msg;
@@ -89,6 +96,7 @@ export async function sendTelegramAlert(payload: TelegramAlertPayload): Promise<
     const message = buildAlertMessage(payload);
     const url = `${TELEGRAM_API}/bot${botToken}/sendMessage`;
     const res = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -100,15 +108,12 @@ export async function sendTelegramAlert(payload: TelegramAlertPayload): Promise<
     });
 
     if (!res.ok) {
-      const err = await res.text();
-      console.error("[Telegram] Failed to send alert:", err);
       return false;
     }
 
     console.log("[Telegram] Alert sent successfully for mode:", payload.mode);
     return true;
-  } catch (err) {
-    console.error("[Telegram] Error sending alert:", err);
+  } catch {
     return false;
   }
 }

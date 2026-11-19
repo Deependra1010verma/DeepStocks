@@ -1,83 +1,91 @@
-/**
- * IST (Asia/Kolkata, UTC+5:30) timezone helpers.
- * Always use these instead of new Date().toISOString() for India market logic.
- */
-
-/** Returns current date string in IST as "YYYY-MM-DD" */
-export function todayIST(): string {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-  // en-CA gives YYYY-MM-DD format natively
-}
-
-/** Returns current IST date as a Date object (midnight IST) */
-export function nowIST(): Date {
-  const ist = new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
-  return new Date(ist);
-}
-
-/** Converts any Date → IST date string "YYYY-MM-DD" */
-export function dateToISTString(d: Date): string {
-  return d.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
-}
-
-export type MarketSession = {
-  state: "PRE_OPEN" | "LIVE" | "CLOSED";
-  label: "PRE-OPEN" | "LIVE MARKET" | "MARKET CLOSED";
-  message: string;
-  timeIST: string;
+// NSE cash-market calendar: NSE/CMTR/71775, 12 Dec 2025.
+// Extend this reviewed calendar before enabling a new year; unknown dates fail closed.
+const HOLIDAYS: Record<string, string> = {
+  '2026-01-15': 'Maharashtra municipal election (NSE/CMTR/72260)',
+  '2026-01-26': 'Republic Day', '2026-03-03': 'Holi',
+  '2026-03-26': 'Ram Navami', '2026-03-31': 'Mahavir Jayanti',
+  '2026-04-03': 'Good Friday', '2026-04-14': 'Ambedkar Jayanti',
+  '2026-05-01': 'Maharashtra Day', '2026-05-28': 'Bakri Id',
+  '2026-06-26': 'Muharram', '2026-09-14': 'Ganesh Chaturthi',
+  '2026-10-02': 'Gandhi Jayanti', '2026-10-20': 'Dussehra',
+  '2026-11-10': 'Diwali Balipratipada', '2026-11-24': 'Guru Nanak Jayanti',
+  '2026-12-25': 'Christmas',
 };
-
-/** Returns the NSE session state using India Standard Time. */
-export function getMarketSession(now = new Date()): MarketSession {
-  const parts = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(now);
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  const dayName = values.weekday;
-  const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(dayName);
-  const hour = Number(values.hour);
-  const min = Number(values.minute);
-  const timeInMins = hour * 60 + min;
-  const timeIST = `${values.hour}:${values.minute} IST`;
-
-  if (day === 0 || day === 6) {
-    return { state: "CLOSED", label: "MARKET CLOSED", message: "Weekend — showing previous close data", timeIST };
-  }
-
-  if (timeInMins >= 9 * 60 && timeInMins < 9 * 60 + 15) {
-    return { state: "PRE_OPEN", label: "PRE-OPEN", message: "Pre-open session — prices can change before 9:15", timeIST };
-  }
-
-  const marketOpen  = 9 * 60 + 15;  // 9:15
-  const marketClose = 15 * 60 + 30; // 15:30
-
-  if (timeInMins >= marketOpen && timeInMins <= marketClose) {
-    return { state: "LIVE", label: "LIVE MARKET", message: "NSE session is open", timeIST };
-  }
-
-  return { state: "CLOSED", label: "MARKET CLOSED", message: "Showing previous close data", timeIST };
+export const CALENDAR_VERSION = 'NSE-CM-2026-v2-CAS';
+export function cashSessionLimits(day: string, casEligible: boolean | null = null) {
+  if (day < '2026-08-03' || casEligible === false) return { continuousEnd: 930, finalClose: 930 };
+  // SEBI circular 23843/2026, paragraph 6.1, applies from 7 Dec 2026.
+  return day >= '2026-12-07' ? { continuousEnd: 930, finalClose: 945 } : { continuousEnd: 915, finalClose: 935 };
 }
-
-/** Check if NSE market is currently open (Mon–Fri, 9:15–15:30 IST). */
-export function isMarketOpen(): boolean {
-  return getMarketSession().state === "LIVE";
+const istDateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' });
+export function dateToISTString(date: Date): string {
+  return Number.isFinite(+date) ? istDateFormatter.format(date) : 'Invalid Date';
 }
-
-/** Telegram automation window requested by the product: 09:20–15:15 IST. */
-export function isAutomationWindow(now = new Date()): boolean {
-  const parts = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(now);
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(values.weekday);
-  const minutes = Number(values.hour) * 60 + Number(values.minute);
-  return day >= 1 && day <= 5 && minutes >= 9 * 60 + 20 && minutes <= 15 * 60 + 15;
+export function todayIST(): string { return dateToISTString(new Date()); }
+export function minutesIST(date: Date): number {
+  const shifted = new Date(date.getTime() + 19_800_000);
+  return shifted.getUTCHours() * 60 + shifted.getUTCMinutes();
 }
+export function shiftDate(date: string, days: number): string {
+  return new Date(new Date(`${date}T12:00:00Z`).getTime() + days * 86400000).toISOString().slice(0, 10);
+}
+export function calendarDay(date: string): { trading: boolean; verified: boolean; reason?: string } {
+  if (!date.startsWith('2026-')) return { trading: false, verified: false, reason: 'Exchange calendar needs updating for this year' };
+  if (date === '2026-11-08') return { trading: false, verified: false, reason: 'Muhurat session: special-session timings require verification' };
+  if (HOLIDAYS[date]) return { trading: false, verified: true, reason: HOLIDAYS[date] };
+  const day = new Date(`${date}T12:00:00Z`).getUTCDay();
+  return { trading: day !== 0 && day !== 6, verified: true, reason: day === 0 || day === 6 ? 'Weekend' : undefined };
+}
+export function isContinuous15mBar(date: Date, casEligible: boolean | null = null): boolean {
+  const minute = minutesIST(date);
+  if (!(minute >= 555) || +date % 900000 !== 0) return false;
+  const day = dateToISTString(date);
+  return calendarDay(day).trading && minute + 15 <= cashSessionLimits(day, casEligible).continuousEnd;
+}
+export type MarketSession = { state: 'PRE_OPEN' | 'LIVE' | 'CLOSED' | 'UNKNOWN'; label: string; message: string; timeIST: string; calendarVerified: boolean };
+export function getMarketSession(now = new Date(), casEligible: boolean | null = null): MarketSession {
+  const day = calendarDay(dateToISTString(now)), minutes = minutesIST(now);
+  const timeIST = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')} IST`;
+  const base = { timeIST, calendarVerified: day.verified };
+  if (!day.verified) return { ...base, state: 'UNKNOWN', label: 'SESSION UNVERIFIED', message: day.reason! };
+  if (!day.trading) return { ...base, state: 'CLOSED', label: 'MARKET CLOSED', message: `${day.reason} — showing last available session` };
+  // NSE cash CAS took effect 3 Aug 2026. Eligibility belongs to the dated
+  // instrument master, not an inferred sector or a stale F&O list.
+  const limits = cashSessionLimits(dateToISTString(now), casEligible);
+  if (minutes >= limits.continuousEnd && minutes < limits.finalClose) {
+    return { ...base, state: 'UNKNOWN', label: casEligible ? 'CLOSING AUCTION' : 'MIXED CLOSING SESSIONS', message: casEligible ? 'Closing auction; continuous-session entry rules are disabled' : 'CAS eligibility unverified; continuous entry disabled during mixed closing sessions' };
+  }
+  if (minutes >= 540 && minutes < 555) return { ...base, state: 'PRE_OPEN', label: 'PRE-OPEN', message: 'Auction prices are indicative until matched' };
+  if (minutes >= 555 && minutes < limits.continuousEnd) return { ...base, state: 'LIVE', label: 'MARKET OPEN', message: 'NSE cash session open; quote freshness is shown separately' };
+  return { ...base, state: 'CLOSED', label: 'MARKET CLOSED', message: 'Outside regular cash session; showing last available data' };
+}
+export function isMarketOpen(): boolean { return getMarketSession().state === 'LIVE'; }
+export function nextMarketOpen(now = new Date()): Date {
+  let day = dateToISTString(now);
+  for (let i = 0; i < 370; i++, day = shiftDate(day, 1)) {
+    const open = new Date(`${day}T09:15:00+05:30`);
+    if (calendarDay(day).trading && open > now) return open;
+  }
+  return new Date(now.getTime() + 60_000);
+}
+export function latestCompletedSession(now = new Date(), casEligible: boolean | null = null): string | null {
+  let day = dateToISTString(now);
+  const closeMinute = cashSessionLimits(day, casEligible).finalClose;
+  if (minutesIST(now) < closeMinute) day = shiftDate(day, -1);
+  for (let i = 0; i < 15; i++, day = shiftDate(day, -1)) if (calendarDay(day).trading) return day;
+  return null;
+}
+export function tradingDaysAway(from: Date, to: Date): number | null {
+  let day = dateToISTString(from); const end = dateToISTString(to);
+  if (end < day || !calendarDay(day).verified) return null;
+  let count = 0;
+  for (let i = 0; day < end && i < 370; i++) {
+    day = shiftDate(day, 1); const session = calendarDay(day);
+    if (!session.verified) return null;
+    if (session.trading) count++;
+  }
+  return day === end ? count : null;
+}
+export function isAutomationWindow(now = new Date()): boolean { return getMarketSession(now).state === 'LIVE' && minutesIST(now) >= 560; }
+export function isLongTermEodWindow(now = new Date()): boolean { return calendarDay(dateToISTString(now)).trading && minutesIST(now) >= 945 && minutesIST(now) < 1020; }
+export function isPreOpenWindow(now = new Date()): boolean { return getMarketSession(now).state === 'PRE_OPEN' && minutesIST(now) >= 552 && minutesIST(now) < 555; }

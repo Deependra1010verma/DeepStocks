@@ -1,0 +1,26 @@
+import { it,expect } from 'vitest';
+import { evaluatePaperSignal,summarizePaperSignals,signalExpiry,type PaperSignal } from '../src/lib/ledgerEngine';
+import { bar } from './fixtures';
+const base: PaperSignal={status:'PENDING',entryLow:99,entryHigh:101,entry:100,stopLoss:90,target1:110,target2:120,createdAt:'2026-11-18T04:00:00Z',entryExpiresAt:'2026-11-20T04:00:00Z',expiresAt:'2026-12-01T04:00:00Z',slippageBps:0,costBps:0};
+const now=new Date('2026-11-18T10:00:00Z');
+const candle=(o:number,h:number,l:number,c:number,date='2026-11-18T04:15:00Z')=>({...bar(date,c),open:o,high:h,low:l});
+it('does not use a candle that started before signal creation',()=>expect(evaluatePaperSignal({...base,createdAt:'2026-11-18T04:16:00Z'},[candle(100,120,90,110)],now).status).toBe('PENDING'));
+it('does not fill a price zone never touched',()=>expect(evaluatePaperSignal(base,[candle(105,108,103,106)],now).status).toBe('PENDING'));
+it('same candle SL/target is excluded, never a manufactured win',()=>{const s=evaluatePaperSignal(base,[candle(100,115,89,110)],now);expect(s.status).toBe('AMBIGUOUS');expect(s.realizedR).toBeUndefined();});
+it('intrabar entry/target sequence is unresolved',()=>expect(evaluatePaperSignal(base,[candle(105,115,99,110)],now).status).toBe('AMBIGUOUS'));
+it('continues from T1 to T2 on later bars',()=>{const first=evaluatePaperSignal(base,[candle(100,112,99,111)],now);expect(first.status).toBe('TARGET1');const end=evaluatePaperSignal(first,[candle(111,122,105,121,'2026-11-18T04:30:00Z')],now);expect(end.status).toBe('TARGET2');expect(end.realizedR).toBe(1.5);});
+it('after T1, retouching T1 with stop does not create false ambiguity',()=>{const first=evaluatePaperSignal(base,[candle(100,112,99,111)],now);const end=evaluatePaperSignal(first,[candle(105,111,88,89,'2026-11-18T04:30:00Z')],now);expect(end.status).toBe('STOP_LOSS');expect(end.realizedR).toBe(0);});
+it('a gap through SL exits at the opening price before later highs',()=>{const s=evaluatePaperSignal({...base,status:'OPEN',filledAt:base.createdAt},[candle(80,112,79,110)],now);expect(s.status).toBe('STOP_LOSS');expect(s.realizedR).toBe(-2);});
+it('estimated fees and slippage reduce results',()=>{const s=evaluatePaperSignal({...base,costBps:20,slippageBps:5},[candle(100,121,99,120)],now);expect(s.realizedR).toBeLessThan(1.5);});
+it('unfilled expiration is not a losing trade',()=>{const s=evaluatePaperSignal({...base,entryExpiresAt:base.createdAt},[candle(100,105,99,104)],now);expect(s.status).toBe('EXPIRED');expect(summarizePaperSignals([{...s,evaluationVersion:3}]).closed).toBe(0);});
+it('legacy, ambiguous and open records are excluded from win rate',()=>{const win={...base,status:'TARGET2' as const,filledAt:base.createdAt,closedAt:base.entryExpiresAt,realizedR:1.5};const stats=summarizePaperSignals([win,{...win,evaluationVersion:3},{...base,status:'AMBIGUOUS',evaluationVersion:3},{...base,evaluationVersion:3}]);expect(stats.closed).toBe(1);expect(stats.legacyExcluded).toBe(1);expect(stats.ambiguous).toBe(1);expect(stats.confidence95?.[0]).toBeLessThan(0.3);});
+it('missing price history cannot silently become a win',()=>expect(evaluatePaperSignal(base,[candle(100,120,99,120,'2026-11-25T04:15:00Z')],new Date('2026-11-25T10:00:00Z')).status).toBe('UNRESOLVED'));
+it('completed records cannot be reopened by reevaluation',()=>expect(evaluatePaperSignal({...base,status:'STOP_LOSS'},[candle(100,121,99,120)],now).status).toBe('STOP_LOSS'));
+it('entry approached from below fills at the touched zone boundary',()=>{const s=evaluatePaperSignal(base,[candle(98,100,97,100)],now);expect(s.status).toBe('OPEN');expect(s.entry).toBe(99);});
+it('gap above T2 has known precedence over a later intrabar stop',()=>{const s=evaluatePaperSignal({...base,status:'OPEN',filledAt:base.createdAt},[candle(125,126,85,89)],now);expect(s.status).toBe('TARGET2');expect(s.realizedR).toBe(1.5);});
+it('BTST exits at the next continuous close, skipping weekends and holidays',()=>{
+  expect(signalExpiry('btst',new Date('2026-11-20T14:30:00+05:30')).expiresAt.toISOString()).toBe('2026-11-23T09:45:00.000Z');
+  expect(signalExpiry('btst',new Date('2026-11-23T14:30:00+05:30')).expiresAt.toISOString()).toBe('2026-11-25T09:45:00.000Z');
+  expect(signalExpiry('btst',new Date('2026-12-07T15:20:00+05:30')).entryExpiresAt.toISOString()).toBe('2026-12-07T10:00:00.000Z');
+  expect(signalExpiry('intraday',new Date('2026-11-20T10:10:00+05:30'),false).expiresAt.toISOString()).toBe('2026-11-20T10:00:00.000Z');
+});

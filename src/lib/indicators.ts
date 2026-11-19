@@ -7,6 +7,8 @@ export interface OHLCV {
   close: number;
   volume: number;
   date: Date;
+  splitReported?: boolean;
+  restoredFromNse?: boolean;
 }
 
 export function calcEMA(closes: number[], period: number): number[] {

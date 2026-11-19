@@ -31,7 +31,7 @@ const responseSchema = {
 console.log("Testing Gemini response schema...");
 try {
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: process.env.GEMINI_MODEL ?? "gemini-3.8-flash",
     contents: [{ role: "user", parts: [{ text: '{"symbol":"BLUESTARCO","cmp":1800}' }] }],
     config: {
       systemInstruction: "Analyze this Indian stock and return JSON.",

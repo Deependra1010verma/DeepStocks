@@ -1,0 +1,18 @@
+import { beforeEach,it,expect,vi } from 'vitest';
+import { NextRequest } from 'next/server';
+import { createSession,validateSession,requireOwner,requireCron,readBody,apiError } from '../src/lib/apiSecurity';
+import { classifyProviderError,generateJSON } from '../src/lib/aiProvider';
+import { NOW } from './fixtures';
+beforeEach(()=>{vi.stubEnv('APP_ACCESS_PASSWORD','test-password-long-enough');vi.stubEnv('SESSION_SECRET','test-signing-secret-long-enough-for-hmac');});
+it('rejects expired, tampered and rotated sessions',()=>{const token=createSession(+NOW);expect(validateSession(token,+NOW+1)).toBe(true);expect(validateSession(token,+NOW+43200001)).toBe(false);expect(validateSession(token+'x',+NOW)).toBe(false);vi.stubEnv('APP_ACCESS_PASSWORD','different-password-long-enough');expect(validateSession(token,+NOW)).toBe(false);});
+it('unauthenticated read fails before accessing any database',()=>expect(()=>requireOwner(new NextRequest('https://local.test/api/watchlist'))).toThrow('Sign in'));
+it('cross-origin mutation fails even with valid owner cookie',()=>{const req=new NextRequest('https://local.test/api/analyze',{method:'POST',headers:{cookie:`deepstocks_session=${createSession()}`,origin:'https://evil.test'}});expect(()=>requireOwner(req)).toThrow('origin');});
+it('accepts same-origin owner mutation',()=>expect(requireOwner(new NextRequest('https://local.test/api/analyze',{method:'POST',headers:{cookie:`deepstocks_session=${createSession()}`,origin:'https://local.test'}}))).toBe('owner'));
+it('cron query secret does not bypass bearer authentication',()=>{vi.stubEnv('CRON_SECRET','valid-test-secret');expect(()=>requireCron(new NextRequest('https://local.test/api/cron?secret=valid-test-secret'))).toThrow('Unauthorized');expect(()=>requireCron(new NextRequest('https://local.test/api/cron',{headers:{authorization:'Bearer valid-test-secret'}}))).not.toThrow();});
+it.each(['[]','null','invalid'])('rejects invalid JSON body %s',async body=>expect(readBody(new NextRequest('https://local.test/api/test',{method:'POST',body}))).rejects.toMatchObject({code:'INVALID_REQUEST'}));
+it('caps chunked payload size without trusting content-length',async()=>expect(readBody(new NextRequest('https://local.test/api/test',{method:'POST',body:JSON.stringify({value:'x'.repeat(17000)})}))).rejects.toMatchObject({status:413}));
+it('never returns internal error text or credentials',async()=>expect(await apiError(new Error('secret-api-key')).text()).not.toContain('secret-api-key'));
+it.each([[402,'AI_BILLING'],[401,'AI_CREDENTIALS'],[404,'AI_MODEL'],[429,'AI_RATE_LIMIT'],[500,'AI_UNAVAILABLE']])('classifies provider HTTP %i as %s',(status,code)=>expect(classifyProviderError(Number(status),'provider rejected')).toMatchObject({code}));
+it('honors bounded provider retry-after',()=>expect(classifyProviderError(429,'limited',120).retryAfter).toBe(120));
+it('missing Groq key fails without network, database or fallback',async()=>{vi.stubEnv('AI_PROVIDER','groq');vi.stubEnv('GROQ_API_KEY','');const fetch=vi.spyOn(globalThis,'fetch');await expect(generateJSON('test',{},{})).rejects.toMatchObject({code:'AI_NOT_CONFIGURED'});expect(fetch).not.toHaveBeenCalled();});
+it('free-only mode blocks a paid-provider fallback',async()=>{vi.stubEnv('AI_PROVIDER','gemini');vi.stubEnv('AI_FREE_ONLY','true');vi.stubEnv('GEMINI_API_KEY','synthetic-key');await expect(generateJSON('test',{},{})).rejects.toMatchObject({code:'AI_FREE_ONLY'});});

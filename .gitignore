@@ -40,3 +40,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/playwright-report/
+/test-results/
+
+# local audit reports and artifacts
+/audit/
+/AUDIT*.md
+/FIXES-SCANNING-*.md
+/RESEARCH-GROQ-*.md
+/UPGRADE-BACKLOG.md

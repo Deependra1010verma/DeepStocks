@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    "audit/**", // Preserved, standalone baseline diagnostic harnesses.
+    "playwright-report/**",
+    "test-results/**",
   ]),
 ]);
 

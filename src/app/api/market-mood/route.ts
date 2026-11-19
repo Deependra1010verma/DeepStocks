@@ -1,53 +1,36 @@
-import { NextResponse } from "next/server";
-import { fetchHistoricalCandles } from "@/lib/dataFetcher";
-import { calcEMA } from "@/lib/indicators";
+import { requireOwner, apiError } from '@/lib/apiSecurity';
+import { NextRequest, NextResponse } from "next/server";
+import { getMarketRegime } from "@/lib/marketRegime";
 import { getMarketSession } from "@/lib/timezone";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 export const maxDuration = 30;
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const session = getMarketSession();
   try {
-    const candles = await fetchHistoricalCandles("^NSEI", "1d",
-      new Date(Date.now() - 120 * 24 * 60 * 60 * 1000)
-    );
-
-    if (candles.length < 55) {
-      return NextResponse.json({ regime: "NEUTRAL", niftyClose: null, ema20: null, ema50: null, session });
-    }
-
-    const closes = candles.map((c) => c.close);
-    const ema20Arr = calcEMA(closes, 20);
-    const ema50Arr = calcEMA(closes, 50);
-    const niftyClose = closes[closes.length - 1];
-    const ema20 = ema20Arr[ema20Arr.length - 1];
-    const ema50 = ema50Arr[ema50Arr.length - 1];
-
-    let regime: "BULLISH" | "NEUTRAL" | "BEARISH";
-    if (niftyClose > ema20 && ema20 > ema50) {
-      regime = "BULLISH";
-    } else if (niftyClose < ema20 && niftyClose >= ema50) {
-      regime = "NEUTRAL";
-    } else {
-      regime = "BEARISH";
-    }
-
+    requireOwner(req);
+    const market = await getMarketRegime();
     return NextResponse.json({
-      regime,
-      niftyClose: niftyClose.toFixed(2),
-      ema20: ema20.toFixed(2),
-      ema50: ema50.toFixed(2),
+      regime: market.regime,
+      available: market.available,
+      niftyClose: market.niftyClose?.toFixed(2) ?? null,
+      ema20: market.niftyEma20?.toFixed(2) ?? null,
+      ema50: market.niftyEma50?.toFixed(2) ?? null,
+      indiaVix: market.indiaVix?.toFixed(2) ?? null,
+      defensiveMode: market.defensiveMode,
+      riskMultiplier: market.riskMultiplier,
+      positionRiskPercent: market.positionRiskPercent,
+      regimeReason: market.reason,
       session,
-      message: regime === "BEARISH"
+      message: !market.available ? 'Nifty/VIX data unavailable or stale — no new risk cleared' : market.regime === "BEARISH"
         ? "⚠️ Market in Bearish Regime — Use Half Position Sizing"
-        : regime === "NEUTRAL"
+        : market.regime === "NEUTRAL"
         ? "Market in Neutral Zone — Wait for Confirmation"
-        : "✅ Market in Bullish Regime — Setups are Valid",
+        : "Index trend bullish; stock guards still apply",
     });
   } catch (error) {
-    console.error("Market mood error:", error);
-    return NextResponse.json({ regime: "NEUTRAL", session, error: "Failed to fetch market data" }, { status: 500 });
+    return apiError(error);
   }
 }

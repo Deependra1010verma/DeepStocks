@@ -1,187 +1,61 @@
-import { NextRequest, NextResponse } from "next/server";
-import { NSE_SCAN_UNIVERSE } from "@/lib/niftyStocks";
-import { batchFetchStockData } from "@/lib/dataFetcher";
-import { runScreener } from "@/lib/screenerEngine";
-import { sendTelegramAlert } from "@/lib/telegramBot";
-import { connectDB } from "@/lib/db";
-import { getMarketSession, isAutomationWindow, todayIST } from "@/lib/timezone";
-import { SignalLedger } from "@/lib/models/SignalLedger";
-import { Watchlist } from "@/lib/models/Watchlist";
-import { getAppUrl } from "@/lib/appUrl";
-
-export const dynamic = "force-dynamic";
+import { NextRequest, NextResponse } from 'next/server';
+import { requireCron, apiError } from '@/lib/apiSecurity';
+import { getMarketSession, isAutomationWindow, isLongTermEodWindow, todayIST } from '@/lib/timezone';
+import { validMode } from '@/lib/stockService';
+import { getCachedScan, refreshScan, snapshotIsStale } from '@/lib/scanService';
+import { recordPaperSignal, updatePaperLedger } from '@/lib/ledgerService';
+import { queueAlert, deliverAlerts } from '@/lib/alertOutbox';
+import { generateAndCache } from '@/lib/analysisService';
+import { recordOperation, AppError } from '@/lib/operations';
+import { Watchlist } from '@/lib/models/Watchlist';
+import { fetchQuote } from '@/lib/dataFetcher';
+import { connectDB } from '@/lib/db';
+import { completeVerifiedCoverage } from '@/lib/scanProgress';
+export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
-
-// Security: only allow external scheduler calls with an Authorization header.
-// Send: Authorization: Bearer YOUR_CRON_SECRET
-
-export async function GET(req: NextRequest) {
-  const cronSecret = process.env.CRON_SECRET;
-  const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-
-  const isAuthorized = Boolean(cronSecret) && bearer === cronSecret;
-  if (!isAuthorized) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+export async function GET(req: NextRequest){
+ const start=Date.now(),deadline=start+52000;
+ try {
+  requireCron(req);
+  const mode=validMode(req.nextUrl.searchParams.get('mode')??'swing_breakout');
+  const task=req.nextUrl.searchParams.get('task')??'scan';
+  if(!['scan','ledger','alerts','warm'].includes(task))throw new AppError('INVALID_TASK','Unknown scheduler task.',400);
+  const session=getMarketSession();
+  const daily=mode==='longterm'||mode==='positional';
+  const allowed=task==='alerts'||task==='ledger'?(isAutomationWindow()||isLongTermEodWindow()):daily?isLongTermEodWindow():isAutomationWindow();
+  if(!allowed)return NextResponse.json({skipped:true,reason:'Outside verified task/session window',session});
+  await connectDB();
+  if(task==='ledger')return NextResponse.json({success:true,...await updatePaperLedger(deadline)});
+  if(task==='alerts') {
+   const watched=await Watchlist.find({userId:{$in:['owner','local']},alertEnabled:true}).limit(40).lean();
+   for(const item of watched){
+    if(Date.now()>deadline-18000)break;
+    const quote=await fetchQuote(item.symbol),price=quote?.regularMarketPrice,time=quote?.regularMarketTime;
+    if(typeof price!=='number'||!time||Date.now()-+new Date(time)>20*60000||item.zoneLow==null||item.zoneHigh==null||price<item.zoneLow||price>item.zoneHigh)continue;
+    await queueAlert(`zone:${item.symbol}:${todayIST()}`,{mode:'watchlist',marketRegime:'RESEARCH',timestamp:new Date(time).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}),stocks:[{symbol:item.symbol,name:item.symbol,cmp:price,dayChangePercent:quote?.regularMarketChangePercent??0,quantScore:0,rsi:0,rvol:0,defaultSL:item.zoneLow,target1:item.zoneHigh}]},new Date(Date.now()+15*60000));
+   }
+   return NextResponse.json({success:true,...await deliverAlerts(deadline)});
   }
-
-  const mode = (req.nextUrl.searchParams.get("mode") ?? "intraday") as
-    | "intraday"
-    | "btst"
-    | "swing_breakout"
-    | "swing_pullback"
-    | "positional"
-    | "longterm";
-
-  const session = getMarketSession();
-  const results: Record<string, unknown> = { mode, session, timestamp: session.timeIST };
-
-  if (session.state !== "LIVE" || !isAutomationWindow()) {
-    return NextResponse.json({
-      ...results,
-      success: true,
-      skipped: true,
-      reason: session.state !== "LIVE" ? session.message : "Outside Telegram automation window (09:20–15:15 IST)",
-    });
+  if(task==='warm'){
+   const snapshot=await getCachedScan(mode,'All');
+   if(!snapshot||snapshotIsStale(snapshot)||!completeVerifiedCoverage(snapshot.coverage))return NextResponse.json({skipped:true,reason:'Complete verified scan required before AI warming'});
+   let warmed=0;
+   for(const stock of snapshot.stocks.filter(s=>!s.nearMiss&&!s.dataQuality?.stale).slice(0,3)){
+    if(Date.now()>deadline-30000)break;
+    try{await generateAndCache(stock);warmed++;}catch{break;}
+   }
+   return NextResponse.json({success:true,warmed});
   }
-
-  try {
-    let dbAvailable = false;
-    // 1. Try connecting to DB for caching (optional)
-    try {
-      await connectDB();
-      dbAvailable = true;
-      results.dbConnected = true;
-    } catch {
-      results.dbConnected = false;
-    }
-
-    // 2. Fetch market regime
-    let marketRegime: "BULLISH" | "NEUTRAL" | "BEARISH" = "NEUTRAL";
-    try {
-      const baseUrl = getAppUrl();
-      const moodRes = await fetch(`${baseUrl}/api/market-mood`);
-      const moodData = await moodRes.json();
-      marketRegime = moodData.regime ?? "NEUTRAL";
-    } catch {
-      console.warn("[Cron] Could not fetch market mood, defaulting NEUTRAL");
-    }
-
-    // 3. Run the screener
-    const withFundamentals = mode === "positional" || mode === "longterm";
-    const withWeekly = mode !== "intraday";
-    const interval = mode === "intraday" ? "15m" : "1d";
-    const symbols = NSE_SCAN_UNIVERSE.map((s) => s.symbol);
-    const stockDataMap = await batchFetchStockData(symbols, interval as "1d" | "1wk" | "15m", withFundamentals, withWeekly);
-
-    for (const [symbol, data] of stockDataMap) {
-      const meta = NSE_SCAN_UNIVERSE.find((stock) => stock.symbol === symbol);
-      if (meta) data.sector = meta.sector;
-    }
-
-    if (dbAvailable) {
-      const openSignals = await SignalLedger.find({ status: "OPEN" }).lean();
-      await Promise.all(openSignals.map(async (signal) => {
-        const quote = stockDataMap.get(signal.symbol)?.currentPrice;
-        if (quote == null) return;
-        const status = quote <= signal.stopLoss
-          ? "STOP_LOSS"
-          : quote >= signal.target2
-          ? "TARGET2"
-          : quote >= signal.target1
-          ? "TARGET1"
-          : "OPEN";
-        if (status !== "OPEN") {
-          await SignalLedger.updateOne({ _id: signal._id }, { $set: { status, updatedAt: new Date() } });
-        }
-      }));
-    }
-
-    const screened = runScreener(mode, stockDataMap);
-
-    // Inject sector
-    const enriched = screened.map((s) => {
-      const meta = NSE_SCAN_UNIVERSE.find((m) => m.symbol === s.symbol);
-      return { ...s, sector: meta?.sector ?? "Unknown" };
-    });
-
-    results.stocksFound = enriched.length;
-
-    // 4. Send Telegram alert
-    const IST = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-    let alertStocks = enriched.filter((stock) => !stock.nearMiss && !stock.extensionWarning && stock.quantScore >= 65);
-    if (dbAvailable) {
-      const freshSignals = await Promise.all(alertStocks.map(async (stock) => {
-        const signalDate = todayIST();
-        const exists = await SignalLedger.exists({ symbol: stock.symbol, mode, signalDate });
-        if (exists) return null;
-        await SignalLedger.updateOne(
-          { symbol: stock.symbol, mode, signalDate },
-          {
-            $set: {
-              entry: stock.cmp,
-              stopLoss: stock.defaultSL,
-              target1: stock.target1,
-              target2: stock.target2,
-              quantScore: stock.quantScore,
-              status: "OPEN",
-              updatedAt: new Date(),
-            },
-          },
-          { upsert: true }
-        );
-        return stock;
-      }));
-      alertStocks = freshSignals.filter((stock): stock is typeof enriched[number] => stock !== null);
-    }
-    const alertSent = await sendTelegramAlert({
-      mode,
-      stocks: alertStocks.map((s) => ({
-        symbol: s.symbol,
-        name: s.name,
-        cmp: s.cmp,
-        dayChangePercent: s.dayChangePercent,
-        quantScore: s.quantScore,
-        rsi: s.rsi,
-        rvol: s.rvol,
-        defaultSL: s.defaultSL,
-        target1: s.target1,
-      })),
-      marketRegime,
-      timestamp: IST,
-    });
-
-    let watchlistAlerts = 0;
-    if (dbAvailable) {
-      const watchItems = await Watchlist.find({ alertEnabled: true }).lean();
-      const hits = watchItems.flatMap((item) => {
-        const quote = stockDataMap.get(item.symbol)?.currentPrice;
-        if (quote == null || item.zoneLow == null || item.zoneHigh == null || quote < item.zoneLow || quote > item.zoneHigh) return [];
-        const stock = stockDataMap.get(item.symbol);
-        return stock ? [{
-          symbol: item.symbol,
-          name: stock.name,
-          cmp: quote,
-          dayChangePercent: stock.dayChangePercent,
-          quantScore: 0,
-          rsi: 0,
-          rvol: 0,
-          defaultSL: item.zoneLow,
-          target1: item.zoneHigh,
-        }] : [];
-      });
-      if (hits.length > 0) {
-        watchlistAlerts = hits.length;
-        await sendTelegramAlert({ mode: "watchlist", stocks: hits, marketRegime, timestamp: session.timeIST });
-      }
-    }
-
-    results.alertSent = alertSent;
-    results.watchlistAlerts = watchlistAlerts;
-    results.success = true;
-
-    return NextResponse.json(results);
-  } catch (error) {
-    console.error("[Cron] EOD sync error:", error);
-    return NextResponse.json({ error: String(error), ...results }, { status: 500 });
+  const snapshot=await refreshScan(mode,'All',deadline-3000);
+  if(snapshotIsStale(snapshot)||!completeVerifiedCoverage(snapshot.coverage)){
+   return NextResponse.json({skipped:true,reason:'Complete verified scan required before recording signals or setup alerts',coverage:snapshot.coverage});
   }
+  for(const stock of snapshot.stocks.filter(s=>!s.nearMiss&&!s.dataQuality?.stale&&s.quantScore>=65&&s.primaryRank).slice(0,5)){
+   if(Date.now()>deadline-3000)break;
+   await recordPaperSignal(stock);
+   await queueAlert(`setup:${mode}:${stock.symbol}:${todayIST()}`,{mode,marketRegime:stock.regime??'NEUTRAL',timestamp:stock.dataQuality?.quoteAt??snapshot.generatedAt.toISOString(),stocks:[stock]},new Date(Date.now()+15*60000));
+  }
+  await recordOperation(`cron:${mode}`,{status:'ok',task,coverage:snapshot.coverage,latencyMs:Date.now()-start});
+  return NextResponse.json({success:true,mode,coverage:snapshot.coverage,generatedAt:snapshot.generatedAt,delivery:'Queued; alerts task delivers with expiry/deduplication'});
+ }catch(e){if(!(e instanceof AppError&&e.status===401))await recordOperation('cron',{status:e instanceof AppError?e.code:'FAILED'});return apiError(e);}
 }

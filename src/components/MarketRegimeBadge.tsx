@@ -3,27 +3,32 @@
 export interface SectorStrength {
   sector: string;
   changePercent: number;
-  representative: string;
+  index?: string;
 }
 
 interface Props {
+  available?: boolean;
   regime: "BULLISH" | "NEUTRAL" | "BEARISH" | null;
   niftyClose: string | null;
   ema20: string | null;
   ema50: string | null;
+  indiaVix?: string | null;
+  defensiveMode?: boolean;
+  riskMultiplier?: number;
+  regimeReason?: string | null;
   message: string | null;
   loading: boolean;
   topSectors?: SectorStrength[];
   session?: {
-    state: "PRE_OPEN" | "LIVE" | "CLOSED";
-    label: "PRE-OPEN" | "LIVE MARKET" | "MARKET CLOSED";
+    state: "PRE_OPEN" | "LIVE" | "CLOSED" | "UNKNOWN";
+    label: string;
     message: string;
     timeIST: string;
   };
 }
 
 export default function MarketRegimeBadge({
-  regime, niftyClose, ema20, ema50, loading, topSectors = [], session
+  available, regime, niftyClose, ema20, ema50, indiaVix, defensiveMode, riskMultiplier, regimeReason, loading, topSectors = [], session
 }: Props) {
   if (loading) {
     return (
@@ -80,7 +85,7 @@ export default function MarketRegimeBadge({
           <span className={`relative inline-flex rounded-full h-2 w-2 ${cfg.dot}`} />
         </span>
         <span className={`font-bold text-xs tracking-widest ${cfg.text}`}>
-          NIFTY {cfg.icon} {cfg.label}
+          NIFTY {available===false ? 'DATA UNAVAILABLE' : `${cfg.icon} ${cfg.label}`}
         </span>
         {niftyClose && (
           <span className="text-xs opacity-60 font-mono hidden lg:inline">
@@ -92,7 +97,22 @@ export default function MarketRegimeBadge({
             E20:{ema20} · E50:{ema50}
           </span>
         )}
+        {indiaVix && (
+          <span className={`text-xs font-mono hidden lg:inline ${defensiveMode ? "text-red-300" : "opacity-60"}`} title={regimeReason ?? undefined}>
+            VIX:{indiaVix}
+          </span>
+        )}
       </div>
+
+      {available === false ? (
+        <span className="inline-flex rounded-md border border-amber-800/70 bg-amber-950/50 px-2 py-1 text-[10px] font-bold tracking-wider text-amber-300">
+          NEW-ENTRY SIZING PAUSED
+        </span>
+      ) : defensiveMode && (
+        <span className="inline-flex items-center gap-1 rounded-md border border-red-800/70 bg-red-950/50 px-2 py-1 text-[10px] font-bold tracking-wider text-red-300">
+          DEFENSIVE · {riskMultiplier === 0.5 ? "0.5% risk" : "reduced risk"}
+        </span>
+      )}
 
       {/* Hot sectors */}
       {session && (
@@ -114,10 +134,11 @@ export default function MarketRegimeBadge({
       {/* Hot sectors */}
       {topSectors.length > 0 && (
         <div className="flex items-center gap-1.5 flex-wrap">
-          <span className="text-xs text-slate-600 font-medium hidden sm:inline">HOT:</span>
+          <span className="text-xs text-slate-500 font-medium hidden sm:inline">SECTORS VS NIFTY · 20 SESSIONS</span>
           {topSectors.slice(0, 4).map((s) => (
             <span
               key={s.sector}
+              title={s.index}
               className={`text-xs px-2 py-1 rounded-md border font-mono font-medium transition-all ${
                 s.changePercent >= 0
                   ? "bg-emerald-950/60 border-emerald-800/60 text-emerald-400 hover:border-emerald-600"
@@ -126,7 +147,7 @@ export default function MarketRegimeBadge({
             >
               {s.sector.length > 8 ? s.sector.slice(0, 8) : s.sector}{" "}
               {s.changePercent >= 0 ? "▲" : "▼"}
-              {Math.abs(s.changePercent).toFixed(1)}%
+              {Math.abs(s.changePercent).toFixed(1)} pp
             </span>
           ))}
         </div>

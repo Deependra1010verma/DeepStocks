@@ -1,48 +1,22 @@
-import { NextRequest, NextResponse } from "next/server";
-import { NSE_SCAN_UNIVERSE } from "@/lib/niftyStocks";
-import { batchFetchStockData } from "@/lib/dataFetcher";
-import { runScreener, ScreenerMode } from "@/lib/screenerEngine";
-
-export const dynamic = "force-dynamic";
+import { NextRequest, NextResponse } from 'next/server';
+import { getCachedScan, refreshScan, snapshotIsStale } from '@/lib/scanService';
+import { validMode } from '@/lib/stockService';
+import { SECTORS } from '@/lib/niftyStocks';
+import { authorizeRequest, requireOwner, apiError, readBody } from '@/lib/apiSecurity';
+import { AppError } from '@/lib/operations';
+import { beforeDeadline, DeadlineError } from '@/lib/deadline';
+export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
-
+function sectorOf(value: unknown): string { const sector=String(value??'All');if(sector!=='All'&&!SECTORS.includes(sector))throw new AppError('INVALID_SECTOR','Invalid sector.',400);return sector; }
+export async function GET(req: NextRequest) {
+ try { requireOwner(req); const mode=validMode(req.nextUrl.searchParams.get('mode')??'swing_breakout'), sector=sectorOf(req.nextUrl.searchParams.get('sector')); const cached=await getCachedScan(mode,sector); return NextResponse.json(cached?{...cached,mode,sector,stale:snapshotIsStale(cached)}:{stocks:[],removedToday:[],mode,sector,stale:true,needsRefresh:true},{headers:{'Cache-Control':'no-store'}}); }
+ catch(e){return apiError(e);}
+}
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const mode: ScreenerMode = body.mode ?? "swing_breakout";
-    const sectorFilter: string | null = body.sector ?? null;
-
-    let stocks = NSE_SCAN_UNIVERSE;
-    if (sectorFilter && sectorFilter !== "All") {
-      stocks = NSE_SCAN_UNIVERSE.filter((s) => s.sector === sectorFilter);
-    }
-
-    const symbols = stocks.map((s) => s.symbol);
-    const withFundamentals = mode === "positional" || mode === "longterm";
-    const withWeekly = mode !== "intraday";
-    const interval = mode === "intraday" ? "15m" : "1d";
-
-    const stockDataMap = await batchFetchStockData(symbols, interval, withFundamentals, withWeekly);
-
-    // Inject sector info
-    for (const [sym, data] of stockDataMap) {
-      const meta = NSE_SCAN_UNIVERSE.find((s) => s.symbol === sym);
-      if (meta) {
-        data.sector = meta.sector;
-      }
-    }
-
-    const screened = runScreener(mode, stockDataMap);
-
-    // Inject sector into screened results
-    const enriched = screened.map((s) => {
-      const meta = NSE_SCAN_UNIVERSE.find((m) => m.symbol === s.symbol);
-      return { ...s, sector: meta?.sector ?? "Unknown" };
-    });
-
-    return NextResponse.json({ stocks: enriched, count: enriched.length, mode });
-  } catch (error) {
-    console.error("Scan error:", error);
-    return NextResponse.json({ error: "Scan failed", details: String(error) }, { status: 500 });
-  }
+ try {
+   const body = await beforeDeadline(async () => { await authorizeRequest(req,'scan',4); return readBody(req); }, Date.now() + 4000);
+   const mode=validMode(body.mode),sector=sectorOf(body.sector);
+   const result=await refreshScan(mode,sector);
+   return NextResponse.json({...result,mode,sector,stale:snapshotIsStale(result)});
+ } catch(e){return apiError(e instanceof DeadlineError ? new AppError('SCAN_START_TIMEOUT','Scan could not start in time. Saved results are retained; retry shortly.',504,60) : e);}
 }

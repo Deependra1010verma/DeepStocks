@@ -1,0 +1,11 @@
+import { it,expect,vi,beforeEach } from 'vitest';
+const mocks=vi.hoisted(()=>({updateOne:vi.fn(),deleteOne:vi.fn(),connect:vi.fn()}));
+vi.mock('../src/lib/db',()=>({connectDB:mocks.connect}));
+vi.mock('mongoose',()=>({default:{connection:{db:{collection:()=>({updateOne:mocks.updateOne,deleteOne:mocks.deleteOne})}}}}));
+import { withLease,consumeBudget } from '../src/lib/operations';
+beforeEach(()=>{mocks.updateOne.mockReset().mockResolvedValue({});mocks.deleteOne.mockReset().mockResolvedValue({});});
+it('contended shared lease never executes duplicate work',async()=>{mocks.updateOne.mockRejectedValue({code:11000});const work=vi.fn();await expect(withLease('scan:test',work)).rejects.toMatchObject({code:'IN_PROGRESS',status:409});expect(work).not.toHaveBeenCalled();});
+it('work failures release only the owning lease',async()=>{await expect(withLease('scan:test',async()=>{throw new Error('failure');})).rejects.toThrow('failure');const acquired=mocks.updateOne.mock.calls[0][1].$set.owner;expect(mocks.deleteOne).toHaveBeenCalledWith({_id:'lease:scan:test',owner:acquired});});
+it('exhausted shared budget fails closed instead of allowing a provider call',async()=>{mocks.updateOne.mockRejectedValue({code:11000});await expect(consumeBudget('ai',2,60000)).rejects.toMatchObject({code:'RATE_LIMITED',status:429});});
+it('DB coordination failure does not fall back to unmetered generation',async()=>{mocks.updateOne.mockRejectedValue(new Error('database failed'));await expect(consumeBudget('ai',2,60000)).rejects.toMatchObject({code:'BUDGET_UNAVAILABLE'});});
+it('token reservation includes the upcoming completion',async()=>{await consumeBudget('tokens',8000,60000,5000);expect(mocks.updateOne.mock.calls[0][0].$or[1]).toEqual({count:{$lte:3000}});expect(mocks.updateOne.mock.calls[0][1].$inc).toEqual({count:5000});});

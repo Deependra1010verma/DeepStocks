@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   RefreshCw, TrendingUp, Activity, BarChart2, Target, Clock,
   Zap, ChevronDown, Layers, Search
@@ -9,9 +9,19 @@ import MarketRegimeBadge, { type SectorStrength } from "@/components/MarketRegim
 import StockList from "@/components/StockList";
 import dynamic from "next/dynamic";
 import AIReportCard from "@/components/AIReportCard";
+import PortfolioDesk from '@/components/PortfolioDesk';
 import { ScreenedStock, ScreenerMode } from "@/lib/screenerEngine";
-import { AIAnalysisResult } from "@/lib/aiAnalyst";
+import type { AIAnalysisResult } from "@/lib/aiAnalyst";
 import { SECTORS } from "@/lib/niftyStocks";
+import AccessGate from '@/components/AccessGate';
+import OperationsStatus from '@/components/OperationsStatus';
+import { guardFingerprint, priceMovedBeyondCache, ANALYSIS_VERSION } from '@/lib/aiCachePolicy';
+import { getTradePlan } from '@/lib/tradePlan';
+import { recheckDataQuality } from '@/lib/dataQuality';
+import { clientProviderVersion, clientAIConfigured } from '@/lib/clientProvider';
+import { beforeDeadline } from '@/lib/deadline';
+import { getMarketSession } from '@/lib/timezone';
+import type { RemovedScanStock } from "@/lib/models/ScanSnapshot";
 
 const CandlestickChart = dynamic(() => import("@/components/CandlestickChart"), {
   ssr: false,
@@ -26,14 +36,19 @@ const CandlestickChart = dynamic(() => import("@/components/CandlestickChart"), 
 });
 
 interface MarketMood {
+  available?: boolean;
   regime: "BULLISH" | "NEUTRAL" | "BEARISH";
   niftyClose: string | null;
   ema20: string | null;
   ema50: string | null;
+  indiaVix?: string | null;
+  defensiveMode?: boolean;
+  riskMultiplier?: number;
+  regimeReason?: string | null;
   message: string | null;
   session?: {
-    state: "PRE_OPEN" | "LIVE" | "CLOSED";
-    label: "PRE-OPEN" | "LIVE MARKET" | "MARKET CLOSED";
+    state: "PRE_OPEN" | "LIVE" | "CLOSED" | "UNKNOWN";
+    label: string;
     message: string;
     timeIST: string;
   };
@@ -46,121 +61,439 @@ interface ModeConfig {
   desc: string;
 }
 
+interface ScanPayload {
+  status?: 'ready' | 'partial' | 'unavailable';
+  message?: string;
+  needsRefresh?: boolean;
+  coverage?: {requested:number;attempted?:number;processed:number;verified?:number;failed:string[];deferred?:string[]};
+  stocks?: ScreenedStock[];
+  removedToday?: RemovedScanStock[];
+  generatedAt?: string;
+  expiresAt?: string;
+  stale?: boolean;
+  cached?: boolean;
+}
+
+interface LedgerInsights {
+  closed: number;
+  wins: number;
+  winRate: number | null;
+  byRvol?: {
+    high: { winRate: number | null; closed: number };
+    low: { winRate: number | null; closed: number };
+  };
+}
+
+interface AnalysisMeta {
+  cached: boolean;
+  cachedAt: string;
+  expiresAt: string;
+}
+
+interface AnalysisFailure {
+  message: string;
+  code?: string;
+}
+
+interface BrowserAnalysisCacheEntry {
+  analysis: AIAnalysisResult;
+  cachedAt: string;
+  expiresAt: string;
+  cachedCmp: number;
+  fingerprint: string;
+  stock: ScreenedStock;
+}
+
+const browserAnalysisCache = new Map<string, BrowserAnalysisCacheEntry>();
+const BROWSER_CACHE_PREFIX = `deepstocks:ai:${ANALYSIS_VERSION}:`;
+
+function browserCacheKey(stock: ScreenedStock, regime: string) {
+  return `${BROWSER_CACHE_PREFIX}${clientProviderVersion()}:${stock.symbol}:${stock.mode}:${regime}`;
+}
+
+function readBrowserAnalysis(stock: ScreenedStock, regime: string): BrowserAnalysisCacheEntry | null {
+  const key = browserCacheKey(stock, regime);
+  let entry = browserAnalysisCache.get(key);
+  if (!entry && typeof window !== "undefined") {
+    try {
+      const raw = window.sessionStorage.getItem(key);
+      entry = raw ? JSON.parse(raw) as BrowserAnalysisCacheEntry : undefined;
+      if (entry) browserAnalysisCache.set(key, entry);
+    } catch {
+      entry = undefined;
+    }
+  }
+  if (!entry || new Date(entry.expiresAt).getTime() <= Date.now()) return null;
+  if (entry.fingerprint !== guardFingerprint(stock) || priceMovedBeyondCache(stock.mode, entry.cachedCmp, stock.cmp)) return null;
+  if (!stock.dataQuality || recheckDataQuality(stock.dataQuality,stock.mode==='intraday').stale) return null;
+  return entry;
+}
+
+function writeBrowserAnalysis(stock: ScreenedStock, regime: string, entry: BrowserAnalysisCacheEntry) {
+  const key = browserCacheKey(stock, regime);
+  browserAnalysisCache.set(key, entry);
+  if (typeof window !== "undefined") {
+    try { window.sessionStorage.setItem(key, JSON.stringify(entry)); } catch { /* storage may be disabled */ }
+  }
+}
+
+async function fetchJsonQuiet<T>(url: string): Promise<T | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(url, {signal:AbortSignal.timeout(12000)});
+      if(response.status===401){window.location.reload();return null;}
+      if (!response.ok) return null;
+      return await response.json() as T;
+    } catch {
+      if (attempt === 0) await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  }
+  return null;
+}
+
+const snapshotRequests = new Map<string, Promise<ScanPayload>>();
+
+function fetchSnapshotPayload(mode: ScreenerMode, sector: string) {
+  const key = `${mode}:${sector}`;
+  const running = snapshotRequests.get(key);
+  if (running) return running;
+  const query = new URLSearchParams({ mode, sector });
+  const request = beforeDeadline(() => fetch(`/api/scan?${query.toString()}`, {signal:AbortSignal.timeout(15000)}), Date.now() + 15000)
+    .then(async (response) => {
+      const data: ScanPayload = await response.json();
+      if (!response.ok) throw new Error("Cached scan unavailable");
+      return data;
+    })
+    .finally(() => snapshotRequests.delete(key));
+  snapshotRequests.set(key, request);
+  return request;
+}
+
 const MODES: ModeConfig[] = [
   { key: "intraday",       label: "Intraday",    icon: <Activity size={12} />,   desc: "Same-day VWAP momentum plays" },
   { key: "btst",           label: "BTST",        icon: <Clock size={12} />,      desc: "Buy Today Sell Tomorrow" },
   { key: "swing_breakout", label: "Swing BO",    icon: <TrendingUp size={12} />, desc: "Resistance breakout stocks" },
   { key: "swing_pullback", label: "Swing PB",    icon: <BarChart2 size={12} />,  desc: "EMA pullback entries" },
   { key: "positional",     label: "Positional",  icon: <Target size={12} />,     desc: "Weeks-long techno-funda plays" },
-  { key: "longterm",       label: "Long-Term",   icon: <Layers size={12} />,     desc: "1–5 year compounders" },
+  { key: "longterm",       label: "Long-Term",   icon: <Layers size={12} />,     desc: "Long-term quality research" },
 ];
 
-export default function Home() {
+function formatIST(value?: string) {
+  if (!value) return "—";
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(value));
+}
+
+function Dashboard() {
+  const [clockNow, setClockNow] = useState(0);
+  useEffect(() => { const tick=()=>setClockNow(Date.now()); tick(); const timer=window.setInterval(tick,30000); return ()=>window.clearInterval(timer); }, []);
+  const [scanError, setScanError] = useState<string|null>(null);
+  const [scanNotice, setScanNotice] = useState<string|null>(null);
+  const [scanStatus, setScanStatus] = useState<ScanPayload['status']>();
+  const [snapshotLoaded, setSnapshotLoaded] = useState(false);
+  const snapshotShown = useRef(false);
+  const snapshotStamp = useRef<string | undefined>(undefined);
+  const refreshControllers = useRef(new Map<string, AbortController>());
+  const refreshCooldown = useRef(new Map<string, number>());
+  const [coverage, setCoverage] = useState<ScanPayload['coverage']>();
+  const [mobilePanel, setMobilePanel] = useState<'results'|'detail'>('results');
+  const [ledgerError, setLedgerError] = useState<string|null>(null);
+  const [paperSaved, setPaperSaved] = useState(false);
+  const scanGeneration = useRef(0), searchGeneration = useRef(0), prefetchGeneration = useRef(0);
   const [marketMood, setMarketMood]     = useState<MarketMood | null>(null);
   const [topSectors, setTopSectors]     = useState<SectorStrength[]>([]);
   const [marketLoading, setMarketLoading] = useState(true);
+  const [ledgerInsights, setLedgerInsights] = useState<LedgerInsights | null>(null);
   const [selectedMode, setSelectedMode] = useState<ScreenerMode>("swing_breakout");
   const [selectedSector, setSelectedSector] = useState("All");
   const [sectorOpen, setSectorOpen]     = useState(false);
   const [stocks, setStocks]             = useState<ScreenedStock[]>([]);
+  const [removedToday, setRemovedToday] = useState<RemovedScanStock[]>([]);
+  const [snapshotMeta, setSnapshotMeta] = useState<{ generatedAt: string; expiresAt: string; cached: boolean } | null>(null);
   const [scanLoading, setScanLoading]   = useState(false);
+  const [refreshing, setRefreshing]     = useState(false);
   const [selectedStock, setSelectedStock] = useState<ScreenedStock | null>(null);
+  const [chartLoading, setChartLoading] = useState(false);
   const [analysis, setAnalysis]         = useState<AIAnalysisResult | null>(null);
+  const [analysisMeta, setAnalysisMeta] = useState<AnalysisMeta | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analysisError, setAnalysisError] = useState<AnalysisFailure | null>(null);
   const [watchlistSaved, setWatchlistSaved] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const refreshInFlight = useRef(new Set<string>());
+  const snapshotInFlight = useRef(new Set<string>());
+  const marketRegimeRef = useRef<MarketMood["regime"]>("NEUTRAL");
+  const analysisController = useRef<AbortController | null>(null);
+  const analysisRequestId = useRef(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    fetch("/api/market-mood")
-      .then((r) => r.json())
-      .then((data) => setMarketMood(data))
-      .catch(console.error)
-      .finally(() => setMarketLoading(false));
+    marketRegimeRef.current = marketMood?.regime ?? "NEUTRAL";
+  }, [marketMood?.regime]);
 
-    fetch("/api/sector-strength")
-      .then((r) => r.json())
-      .then((data) => { if (data.topSectors) setTopSectors(data.topSectors); })
-      .catch(console.error);
+  useEffect(() => {
+    void fetchJsonQuiet<MarketMood>('/api/market-mood').then(m=>{if(m)setMarketMood(m);setMarketLoading(false);});
+    void fetchJsonQuiet<{topSectors?:SectorStrength[]}>('/api/sector-strength').then(d=>{if(d?.topSectors)setTopSectors(d.topSectors);});
+    void fetchJsonQuiet<{stats?:LedgerInsights}>('/api/ledger').then(d=>{if(d?.stats)setLedgerInsights(d.stats);else setLedgerError('Paper ledger unavailable');});
   }, []);
 
-  const runScan = useCallback(async () => {
-    setScanLoading(true);
-    setSelectedStock(null);
-    setAnalysis(null);
-    setAnalysisError(null);
-    try {
-      const res = await fetch("/api/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: selectedMode, sector: selectedSector }),
+  // Keep LIVE/PRE-OPEN/CLOSED accurate when the tab stays open across a
+  // session boundary; the server remains the source of truth in IST.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void fetchJsonQuiet<MarketMood>("/api/market-mood").then((market) => {
+        if (market) setMarketMood(market);
       });
-      const data = await res.json();
-      if (data.stocks) setStocks(data.stocks);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setScanLoading(false);
-    }
-  }, [selectedMode, selectedSector]);
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
-  const handleSelectStock = useCallback(async (stock: ScreenedStock) => {
-    setSelectedStock(stock);
+  const prefetchTopAnalyses = useCallback((nextStocks: ScreenedStock[]) => {
+    if(!clientAIConfigured()) return;
+    const generation = ++prefetchGeneration.current, regime = marketRegimeRef.current;
+    void (async()=>{
+      for(const stock of nextStocks.filter(s=>!s.nearMiss&&!s.dataQuality?.stale).slice(0,3)){
+        if(generation!==prefetchGeneration.current)return;
+        if(readBrowserAnalysis(stock,regime))continue;
+        try {
+          const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:stock.symbol,mode:stock.mode}),signal:AbortSignal.timeout(45000)});
+          if(!response.ok)return; // Never loop through a provider outage or quota error.
+          const data=await response.json();
+          if(data.analysis&&data.stock&&data.fingerprint)writeBrowserAnalysis(data.stock,regime,{analysis:data.analysis,stock:data.stock,cachedAt:data.cachedAt,expiresAt:data.expiresAt,cachedCmp:data.cachedCmp,fingerprint:data.fingerprint});
+        }catch{return;}
+      }
+    })();
+  }, []);
+
+  const applyScanPayload = useCallback((data: ScanPayload) => {
+    if (!Array.isArray(data.stocks)) return;
+    // Scan snapshots supply the list. The detail view owns its independently fetched stock and request.
+    setStocks(data.stocks);
+    setCoverage(data.coverage);
+    setSnapshotLoaded(true); snapshotShown.current = true;
+    const isNewSnapshot = Boolean(data.generatedAt && data.generatedAt !== snapshotStamp.current);
+    snapshotStamp.current = data.generatedAt;
+    setScanStatus(data.status);
+    setRemovedToday(Array.isArray(data.removedToday) ? data.removedToday : []);
+    if (data.generatedAt && data.expiresAt) {
+      setSnapshotMeta({ generatedAt: data.generatedAt, expiresAt: data.expiresAt, cached: Boolean(data.cached) });
+    }
+    if (isNewSnapshot) prefetchTopAnalyses(data.stocks);
+  }, [prefetchTopAnalyses]);
+
+  const refreshInBackground = useCallback(async () => {
+    const generation = scanGeneration.current;
+    const refreshKey = `${selectedMode}:${selectedSector}`;
+    if (refreshInFlight.current.has(refreshKey)) return;
+    if (Date.now() < (refreshCooldown.current.get(refreshKey) ?? 0)) return;
+    const controller = new AbortController();
+    refreshControllers.current.set(refreshKey, controller);
+    refreshInFlight.current.add(refreshKey);
+    setRefreshing(true); setScanError(null);
+    setScanNotice(snapshotShown.current ? 'Refreshing this strategy. Saved results remain visible.' : 'Starting the first scan for this strategy.');
+    try {
+      const res = await beforeDeadline(() => fetch('/api/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: selectedMode, sector: selectedSector }), signal: controller.signal,
+      }).then(async response => ({ response, data: await response.json() })), Date.now() + 55000, controller.signal);
+      if (generation !== scanGeneration.current) return;
+      const { response, data } = res;
+      if (response.ok) {
+        applyScanPayload(data);
+        setScanNotice(data.message ?? null);
+        if (data.expiresAt) refreshCooldown.current.set(refreshKey, Date.parse(data.expiresAt));
+      } else {
+        const seconds = Number(response.headers.get('Retry-After')) || (response.status === 409 ? 15 : 300);
+        refreshCooldown.current.set(refreshKey, Date.now() + Math.max(5, seconds) * 1000);
+        if (response.status === 409) setScanNotice('Another scan is running. Saved results stay visible; checking for updates.');
+        else { setScanNotice(null); setScanError(data.error ?? 'Refresh unavailable. Saved results are retained.'); }
+      }
+    } catch (error) {
+      if (generation === scanGeneration.current) {
+        refreshCooldown.current.set(refreshKey, Date.now() + 60000);
+        setScanNotice(null);
+        setScanError(error instanceof Error && error.name === 'TimeoutError' ? 'Scan timed out. Saved results are retained. Retry in a minute.' : 'Scan could not complete. Saved results are retained. Retry in a minute.');
+      }
+    } finally {
+      controller.abort();
+      if (refreshControllers.current.get(refreshKey) === controller) {
+        refreshControllers.current.delete(refreshKey); refreshInFlight.current.delete(refreshKey);
+      }
+      if (generation === scanGeneration.current) setRefreshing(false);
+    }
+  }, [applyScanPayload, selectedMode, selectedSector]);
+
+  const loadSnapshot = useCallback(async () => {
+    const generation = scanGeneration.current;
+    const snapshotKey = `${generation}:${selectedMode}:${selectedSector}`;
+    if (snapshotInFlight.current.has(snapshotKey)) return;
+    snapshotInFlight.current.add(snapshotKey);
+    setScanLoading(!snapshotShown.current);
+    try {
+      const data = await fetchSnapshotPayload(selectedMode, selectedSector);
+      if (generation !== scanGeneration.current) return;
+      const changed = Boolean(data.generatedAt && data.generatedAt !== snapshotStamp.current);
+      applyScanPayload(data);
+      if (data.message) setScanNotice(data.message);
+      if (changed && !data.stale && !refreshInFlight.current.has(`${selectedMode}:${selectedSector}`)) {
+        setScanError(null); setScanNotice(data.message ?? null);
+      }
+      if (data.needsRefresh || data.stale) void refreshInBackground();
+    } catch {
+      if (generation === scanGeneration.current) setScanError('Could not load the scan snapshot. Saved results are retained; retry refresh.');
+    } finally {
+      snapshotInFlight.current.delete(snapshotKey);
+      if (generation === scanGeneration.current) setScanLoading(false);
+    }
+  }, [applyScanPayload, refreshInBackground, selectedMode, selectedSector]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadSnapshot(); }, 0);
+    const poll = window.setInterval(() => { if (!document.hidden) void loadSnapshot(); }, 15000);
+    const visible = () => { if (!document.hidden) void loadSnapshot(); };
+    document.addEventListener('visibilitychange', visible);
+    return () => { window.clearTimeout(timer); window.clearInterval(poll); document.removeEventListener('visibilitychange', visible); };
+  }, [loadSnapshot]);
+
+  useEffect(() => {
+    const controllers = refreshControllers.current;
+    return () => { for (const controller of controllers.values()) controller.abort(); };
+  }, []);
+
+  const changeContext = (mode: ScreenerMode, sector = selectedSector) => {
+    ++scanGeneration.current; ++searchGeneration.current; ++prefetchGeneration.current; ++analysisRequestId.current;
+    for (const controller of refreshControllers.current.values()) controller.abort();
+    refreshControllers.current.clear(); refreshInFlight.current.clear();
+    snapshotShown.current = false; snapshotStamp.current = undefined; setSnapshotLoaded(false); setScanLoading(false); setRefreshing(false);
+    setScanError(null); setScanNotice(null); setScanStatus(undefined);
+    analysisController.current?.abort();
+    setChartLoading(false);
+    setSelectedMode(mode); setSelectedSector(sector); setSelectedStock(null); setAnalysis(null); setAnalysisMeta(null); setAnalysisError(null); setAnalysisLoading(false); setStocks([]); setRemovedToday([]); setSnapshotMeta(null); setCoverage(undefined); setMobilePanel('results'); setSearchError(null);
+  };
+  const runScan = () => { void refreshInBackground(); };
+
+  const handleSelectStock = useCallback(async (stock: ScreenedStock, forceRefresh = false) => {
+    analysisController.current?.abort();
+    const requestId = ++analysisRequestId.current;
+    const regime = marketRegimeRef.current;
+    setSelectedStock(stock);setMobilePanel("detail");setPaperSaved(false);
     setAnalysis(null);
+    setAnalysisMeta(null);
     setAnalysisError(null);
     setWatchlistSaved(false);
+    setChartLoading(false);
     setAnalysisLoading(true);
     try {
+      if (!forceRefresh) {
+        const browserCached = readBrowserAnalysis(stock, regime);
+        if (browserCached) {
+          setAnalysis(browserCached.analysis);
+          setSelectedStock(browserCached.stock);
+          setAnalysisMeta({ cached: true, cachedAt: browserCached.cachedAt, expiresAt: browserCached.expiresAt });
+          setAnalysisLoading(false);
+          return;
+        }
+      }
+      const controller = new AbortController();
+      analysisController.current = controller;
+      let currentStock = stock;
+      if (!currentStock.candles.length) {
+        setChartLoading(true);
+        const details = await fetch('/api/stock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: stock.symbol, mode: stock.mode }),
+          signal: AbortSignal.any([controller.signal,AbortSignal.timeout(27000)])
+        });
+        const payload = await details.json();
+        if (requestId !== analysisRequestId.current) return;
+        if (!details.ok || !payload.stock) {
+          setAnalysisError({ message: payload.error ?? 'Could not load the chart and updated quant data.', code: payload.code ?? 'DATA_UNAVAILABLE' });
+          return;
+        }
+        currentStock = payload.stock;
+        setSelectedStock(currentStock);
+        setChartLoading(false);
+      }
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stock, marketRegime: marketMood?.regime ?? "NEUTRAL" }),
+        body: JSON.stringify({ symbol:stock.symbol, mode:stock.mode, forceRefresh }),
+        signal: AbortSignal.any([controller.signal,AbortSignal.timeout(55000)]),
       });
       const data = await res.json();
+      if (requestId !== analysisRequestId.current) return;
+      if (data.stock) setSelectedStock(data.stock);
       if (!res.ok || !data.analysis) {
-        throw new Error(data.error ?? data.details ?? "Analysis failed. Please try again.");
+        setAnalysisError({ message: data.error ?? "Analysis failed. Please try again.", code: data.code });
+        return;
       }
       setAnalysis(data.analysis);
-      void fetch("/api/ledger", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          symbol: stock.symbol,
-          mode: stock.mode,
-          signalDate: new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date()),
-          entry: stock.cmp,
-          stopLoss: stock.defaultSL,
-          target1: stock.target1,
-          target2: stock.target2,
-          quantScore: stock.quantScore,
-        }),
-      }).catch(() => undefined);
+      if (data.cachedAt && data.expiresAt) {
+        setAnalysisMeta({ cached: Boolean(data.cached), cachedAt: data.cachedAt, expiresAt: data.expiresAt });
+        writeBrowserAnalysis(data.stock??currentStock, regime, {
+          analysis: data.analysis,
+          cachedAt: data.cachedAt,
+          expiresAt: data.expiresAt,
+          cachedCmp: data.cachedCmp,
+          fingerprint: data.fingerprint,
+          stock: data.stock??currentStock,
+        });
+      }
     } catch (err) {
-      setAnalysisError(err instanceof Error ? err.message : "Analysis failed. Please try again.");
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (requestId === analysisRequestId.current) {
+        setAnalysisError({message: err instanceof Error ? err.message : "Analysis failed. Please try again."});
+      }
     } finally {
-      setAnalysisLoading(false);
+      if (requestId === analysisRequestId.current) {
+        setAnalysisLoading(false);
+        setChartLoading(false);
+      }
     }
-  }, [marketMood]);
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("dialog[open]")) return;
+      const typing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+      if (event.key === "/" && !typing) {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+      if (typing || stocks.length === 0 || (event.key !== "ArrowDown" && event.key !== "ArrowUp")) return;
+      event.preventDefault();
+      const currentIndex = selectedStock ? stocks.findIndex((stock) => stock.symbol === selectedStock.symbol) : -1;
+      const nextIndex = event.key === "ArrowDown"
+        ? (currentIndex + 1) % stocks.length
+        : (currentIndex <= 0 ? stocks.length - 1 : currentIndex - 1);
+      void handleSelectStock(stocks[nextIndex]);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleSelectStock, selectedStock, stocks]);
 
   const saveToWatchlist = useCallback(async () => {
-    if (!selectedStock) return;
-    const res = await fetch("/api/watchlist", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        symbol: selectedStock.symbol,
-        zoneLow: Math.max(0, selectedStock.cmp - selectedStock.atr * 0.5),
-        zoneHigh: selectedStock.cmp + selectedStock.atr * 0.5,
-      }),
-    });
-    if (res.ok) setWatchlistSaved(true);
-  }, [selectedStock]);
+    if(!selectedStock)return;
+    try{const res=await fetch('/api/watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:selectedStock.symbol,mode:selectedStock.mode,alertEnabled:true})});const data=await res.json();if(!res.ok)throw new Error(data.error);setWatchlistSaved(true);}catch(e){setSearchError(e instanceof Error?e.message:'Watchlist unavailable');}
+  },[selectedStock]);
+  const trackPaper = async()=>{
+    if(!selectedStock)return;
+    try{const r=await fetch('/api/ledger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:selectedStock.symbol,mode:selectedStock.mode})});const data=await r.json();if(!r.ok)throw new Error(data.error);setPaperSaved(true);}catch(e){setLedgerError(e instanceof Error?e.message:'Paper tracking unavailable');}
+  };
 
   const handleSearch = useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!searchQuery.trim()) return;
+    const generation=++searchGeneration.current;
     setSearchLoading(true);
     setSearchError(null);
     try {
@@ -171,20 +504,57 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok || !data.stock) throw new Error(data.error ?? "Stock lookup failed");
-      setStocks((current) => [data.stock, ...current.filter((item) => item.symbol !== data.stock.symbol)].slice(0, 10));
+      if(generation!==searchGeneration.current)return;
+      setStocks((current) => [data.stock, ...current.filter((item) => item.symbol !== data.stock.symbol)]);
       await handleSelectStock(data.stock);
     } catch (error) {
-      setSearchError(error instanceof Error ? error.message : "Stock lookup failed");
+      if(generation===searchGeneration.current)setSearchError(error instanceof Error ? error.message : "Stock lookup failed");
     } finally {
-      setSearchLoading(false);
+      if(generation===searchGeneration.current)setSearchLoading(false);
     }
   }, [handleSelectStock, searchQuery, selectedMode]);
 
-  const qualifiedCount = stocks.filter(s => !s.nearMiss).length;
-  const nearMissCount  = stocks.filter(s =>  s.nearMiss).length;
+  const marketDataUnavailable = marketMood?.available === false;
+  const detailStock = useMemo(() => {
+    if (!selectedStock) return null;
+    const source = selectedStock.dataQuality;
+    const current = source && !source.stale && clockNow > 0
+      ? recheckDataQuality(source, selectedStock.mode === 'intraday', new Date(clockNow))
+      : source;
+    const newlyStale = current?.stale && !source?.stale;
+    const marketBlocked = marketDataUnavailable && selectedStock.mode!=='longterm';
+    const shortHorizon=selectedStock.mode==='intraday'||selectedStock.mode==='btst';
+    const sessionEnded=shortHorizon&&clockNow>0&&getMarketSession(new Date(clockNow),selectedStock.casEligible??null).state!=='LIVE';
+    const detailsPending=!selectedStock.candles.length;
+    if (!newlyStale && !marketBlocked && !sessionEnded && !detailsPending) return selectedStock;
+    return {
+      ...selectedStock,
+      nearMiss: true,
+      researchQualified: !newlyStale&&selectedStock.researchQualified,
+      dataQuality: current,
+      guardReasons: [...new Set([
+        ...(selectedStock.guardReasons ?? []),
+        ...(newlyStale ? current.issues : []),
+        ...(marketBlocked ? ['Nifty/VIX data unavailable'] : []),
+        ...(sessionEnded ? ['Continuous trading session is not confirmed open'] : []),
+        ...(detailsPending ? ['Full stock history has not loaded'] : [])
+      ])]
+    };
+  }, [selectedStock, clockNow, marketDataUnavailable]);
+
+  const expiredExplanation = Boolean(analysis && (detailStock?.dataQuality?.stale ||
+    (analysisMeta && clockNow >= Date.parse(analysisMeta.expiresAt))));
+  const visibleAnalysis = expiredExplanation ? null : analysis;
+  const dataPaused = analysisError?.code === 'STALE_DATA' || analysisError?.code === 'DATA_UNAVAILABLE' ||
+    analysisError?.code === 'INSUFFICIENT_HISTORY';
+  const budgetPaused = analysisError?.code === 'AI_DAILY_LIMIT';
+
+  const qualifiedCount = stocks.filter(s => !s.nearMiss || s.researchQualified).length;
+  const nearMissCount = stocks.filter(s => s.nearMiss && !s.researchQualified).length;
+  const selectedPlan = selectedStock?.candles.length ? getTradePlan(selectedStock) : null;
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden" style={{ background: "var(--bg-base)" }}>
+    <div className="h-dvh flex flex-col overflow-hidden" style={{ background: "var(--bg-base)" }}>
 
       {/* ── Header ── */}
       <header className="flex-shrink-0 border-b border-slate-800/60 px-4 py-2.5"
@@ -201,18 +571,24 @@ export default function Home() {
                 Deep<span className="text-cyan-400">Stocks</span>
               </div>
               <div className="text-[9px] text-slate-600 uppercase tracking-wider leading-none mt-0.5">
-                NSE · BSE · AI Screener
+                NSE · Research Screener
               </div>
             </div>
           </div>
 
           {/* Market Regime */}
+          <PortfolioDesk />
           <div className="flex-1">
             <MarketRegimeBadge
+              available={marketMood?.available}
               regime={marketMood?.regime ?? null}
               niftyClose={marketMood?.niftyClose ?? null}
               ema20={marketMood?.ema20 ?? null}
               ema50={marketMood?.ema50 ?? null}
+              indiaVix={marketMood?.indiaVix}
+              defensiveMode={marketMood?.defensiveMode}
+              riskMultiplier={marketMood?.riskMultiplier}
+              regimeReason={marketMood?.regimeReason}
               message={marketMood?.message ?? null}
               loading={marketLoading}
               topSectors={topSectors}
@@ -223,17 +599,29 @@ export default function Home() {
           {/* Scan count */}
           {stocks.length > 0 && (
             <div className="text-xs font-mono text-slate-500 hidden md:block">
-              <span className="text-cyan-400 font-bold">{qualifiedCount}</span> found
+              <span className="text-cyan-400 font-bold">{qualifiedCount}</span> {selectedMode==='longterm'?'research candidates':'found'}
               {nearMissCount > 0 && <span className="text-amber-500 ml-1">· ~{nearMissCount} near</span>}
+              {removedToday.length > 0 && <span className="text-slate-600 ml-1">· {removedToday.length} removed</span>}
             </div>
           )}
         </div>
       </header>
 
-      {/* ── Bearish Banner ── */}
-      {marketMood?.regime === "BEARISH" && (
-        <div className="flex-shrink-0 bg-red-950/60 border-b border-red-900/50 text-red-300 text-xs py-1.5 px-4 text-center">
-          ⚠️ <strong>Bearish Market</strong> — Nifty below EMA50. Use half size, tight stops.
+      {marketMood?.available === false ? (
+        <div className="flex-shrink-0 border-b border-amber-900/50 bg-amber-950/60 px-4 py-1.5 text-center text-xs text-amber-200">
+          <strong>Market data unverified.</strong> Nifty or India VIX data is stale or unavailable. New-entry sizing is paused until the data is verified.
+        </div>
+      ) : (marketMood?.regime === "BEARISH" || marketMood?.defensiveMode) && (
+        <div className="flex-shrink-0 border-b border-red-900/50 bg-red-950/60 px-4 py-1.5 text-center text-xs text-red-300">
+          <strong>Defensive Mode.</strong> {marketMood.regimeReason ?? "Index trend or India VIX indicates elevated risk."} New entries use reduced risk limits.
+        </div>
+      )}
+
+      {ledgerInsights && ledgerInsights.closed > 0 && (
+        <div className="flex-shrink-0 border-b border-slate-800/50 bg-slate-950/70 px-4 py-1.5 text-[10px] font-mono text-slate-500">
+          Ledger: <span className="text-cyan-300">{ledgerInsights.winRate == null ? "—" : `${(ledgerInsights.winRate * 100).toFixed(0)}%`} win rate</span>
+          {ledgerInsights.byRvol?.high.closed ? <> · RVOL ≥1.8: <span className="text-emerald-300">{ledgerInsights.byRvol.high.winRate == null ? "—" : `${(ledgerInsights.byRvol.high.winRate * 100).toFixed(0)}%`}</span></> : null}
+          {ledgerInsights.byRvol?.low.closed ? <> · RVOL &lt;1.8: <span className="text-amber-300">{ledgerInsights.byRvol.low.winRate == null ? "—" : `${(ledgerInsights.byRvol.low.winRate * 100).toFixed(0)}%`}</span></> : null}
         </div>
       )}
 
@@ -244,6 +632,7 @@ export default function Home() {
         <form onSubmit={handleSearch} className="flex items-center gap-1 rounded-md border border-slate-800 bg-slate-950/60 px-2 py-1">
           <Search size={13} className="text-slate-500" />
           <input
+            ref={searchInputRef}
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value.toUpperCase())}
             placeholder="NSE symbol"
@@ -263,7 +652,7 @@ export default function Home() {
             return (
               <button
                 key={m.key}
-                onClick={() => setSelectedMode(m.key)}
+                onClick={() => changeContext(m.key)}
                 title={m.desc}
                 className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-semibold border transition-all ${
                   active
@@ -296,7 +685,7 @@ export default function Home() {
                   {["All", ...SECTORS].map((s) => (
                     <button
                       key={s}
-                      onClick={() => { setSelectedSector(s); setSectorOpen(false); }}
+                      onClick={() => { changeContext(selectedMode,s); setSectorOpen(false); }}
                       className={`w-full text-left text-xs px-3 py-1.5 rounded-lg transition-all ${
                         selectedSector === s
                           ? "bg-cyan-950/60 text-cyan-400"
@@ -315,25 +704,40 @@ export default function Home() {
         {/* Scan button */}
         <button
           onClick={runScan}
-          disabled={scanLoading}
+          disabled={scanLoading || refreshing}
           className={`ml-auto inline-flex items-center gap-1.5 px-4 py-1.5 rounded-md text-xs font-bold border transition-all ${
             scanLoading
               ? "border-slate-700 text-slate-500 cursor-not-allowed"
               : "border-cyan-700 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-900/40"
           }`}
         >
-          {scanLoading
-            ? <><RefreshCw size={11} className="animate-spin" /> Scanning...</>
+          {(scanLoading || refreshing)
+            ? <><RefreshCw size={11} className="animate-spin" /> {scanLoading ? "Loading snapshot..." : "Scanning..."}</>
             : <><Zap size={11} /> Scan {MODES.find(m => m.key === selectedMode)?.label}</>
           }
         </button>
+        {snapshotMeta && (
+          <span className="text-[10px] font-mono text-slate-600 hidden lg:inline-flex items-center gap-1">
+            {refreshing ? <RefreshCw size={10} className="animate-spin text-cyan-500" /> : "●"}
+            {snapshotMeta.cached ? "Cached" : "Snapshot"} {formatIST(snapshotMeta.generatedAt)} IST
+          </span>
+        )}
       </div>
 
+      <div className="flex-shrink-0 border-b border-slate-800 px-4 py-1.5 text-[11px] text-slate-400">
+        {coverage&&<span>Coverage {coverage.processed}/{coverage.requested}{coverage.verified!=null&&` · ${coverage.verified} data-verified when scanned`}{coverage.failed.length>0&&` · ${coverage.failed.length} unavailable`}{Boolean(coverage.deferred?.length)&&` · ${coverage.deferred!.length} pending`}. </span>}
+        {snapshotMeta&&<span>Snapshot {new Date(snapshotMeta.generatedAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST{Date.parse(snapshotMeta.expiresAt)<clockNow?' · refresh due':''}. </span>}
+        Delayed market research; verify execution quotes.
+        {scanNotice&&<p role="status" className="text-cyan-300">{scanNotice}</p>}
+        {(scanError||ledgerError)&&<p role="alert" className="text-amber-300">{scanError||ledgerError}</p>}
+        <OperationsStatus />
+      </div>
+      <div className="flex md:hidden gap-2 px-3 py-2 border-b border-slate-800"><button onClick={()=>setMobilePanel('results')} className="rounded border border-slate-700 px-3 py-1 text-xs">Results</button><button onClick={()=>setMobilePanel('detail')} disabled={!selectedStock} className="rounded border border-slate-700 px-3 py-1 text-xs disabled:opacity-40">Stock details</button></div>
       {/* ── Main 3-pane layout ── */}
       <main className="flex-1 flex gap-0 overflow-hidden min-h-0">
 
         {/* Col 1: Stock List */}
-        <div className="w-[270px] flex-shrink-0 flex flex-col border-r border-slate-800/50"
+        <div className={`${mobilePanel==='results'?'flex':'hidden'} md:flex w-full md:w-[270px] flex-shrink-0 flex-col border-r border-slate-800/50`}
           style={{ background: "var(--bg-panel)" }}>
           <div className="px-3 py-2 border-b border-slate-800/40 flex items-center justify-between flex-shrink-0">
             <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Results</span>
@@ -345,27 +749,36 @@ export default function Home() {
             )}
           </div>
           <div className="flex-1 overflow-y-auto">
-            <StockList stocks={stocks} selected={selectedStock} onSelect={handleSelectStock} loading={scanLoading} />
+            <StockList
+              stocks={stocks}
+              removedToday={removedToday}
+              selected={selectedStock}
+              onSelect={handleSelectStock}
+              loading={scanLoading}
+              emptyTitle={scanError || scanStatus === 'unavailable' ? 'Scan unavailable' : refreshing ? 'Scanning this strategy' : scanStatus==='partial' ? 'Partial scan' : snapshotLoaded ? 'No matching setups' : 'No scan data yet'}
+              emptyMessage={scanError ?? scanNotice ?? (scanStatus === 'partial' ? 'This scan is incomplete. Pending symbols will be checked in the next batch.' : snapshotLoaded ? 'No setups matched the selected strategy and sector in the available data.' : 'Load a saved snapshot or start a scan.')}
+            />
           </div>
         </div>
 
         {/* Col 2+3: Chart + AI report stacked */}
-        <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+        <div className={`${mobilePanel==='detail'?'flex':'hidden'} md:flex flex-1 flex-col overflow-y-auto md:overflow-hidden min-w-0 min-h-0`}>
 
           {/* Chart */}
-          <div className="h-[300px] flex-shrink-0 border-b border-slate-800/50 flex flex-col"
+          <div className="h-[240px] md:h-[300px] flex-shrink-0 border-b border-slate-800/50 flex flex-col"
             style={{ background: "var(--bg-panel)" }}>
             <div className="px-3 py-2 border-b border-slate-800/40 flex items-center gap-2 flex-shrink-0">
               <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">
                 {selectedStock ? selectedStock.symbol.replace(".NS", "") + " — Chart" : "Price Chart"}
               </span>
               {selectedStock && (
-                <div className="ml-auto flex items-center gap-3 text-[11px] font-mono">
-                  <span className="text-slate-500">ATR <span className="text-amber-400">{selectedStock.atr.toFixed(1)}</span></span>
-                  <span className="text-slate-500">VWAP <span className="text-cyan-400">₹{selectedStock.vwap.toFixed(0)}</span></span>
+                <div className="ml-auto flex flex-wrap items-center gap-2 text-[10px] font-mono">
+                  <span className="text-slate-500">ATR <span className="text-amber-400">{selectedStock.atr.toFixed(2)}</span></span>
+                  {selectedStock.mode==='intraday'&&<span className="text-slate-500">VWAP <span className="text-cyan-400">₹{selectedStock.vwap.toFixed(2)}</span></span>}
                   <span className={`font-bold ${selectedStock.dayChangePercent >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                     {selectedStock.dayChangePercent >= 0 ? "▲" : "▼"}{Math.abs(selectedStock.dayChangePercent).toFixed(2)}%
                   </span>
+                  <button onClick={()=>void trackPaper()} disabled={!selectedPlan||Boolean(detailStock?.nearMiss)||paperSaved} className="rounded border border-slate-700 px-2 py-1 text-[10px] disabled:opacity-40">{paperSaved?'Paper tracked':'Track paper'}</button>
                   <button
                     onClick={saveToWatchlist}
                     className="rounded-md border border-slate-700 px-2 py-1 text-[10px] font-semibold text-slate-300 transition hover:border-cyan-700 hover:text-cyan-300"
@@ -375,24 +788,29 @@ export default function Home() {
                 </div>
               )}
             </div>
-            <div className="flex-1 relative grid-bg">
+            <div className="flex-1 relative grid-bg" aria-busy={chartLoading}>
+              {chartLoading && <div role="status" className="absolute inset-0 z-10 grid place-items-center bg-slate-950/80 text-xs text-cyan-300">Loading stock candles…</div>}
               <CandlestickChart
                 candles={selectedStock?.candles ?? []}
                 ema20={selectedStock?.ema20 ?? 0}
                 ema50={selectedStock?.ema50 ?? 0}
                 ema200={selectedStock?.ema200 ?? 0}
                 symbol={selectedStock?.symbol ?? ""}
+              entryPrice={selectedPlan?.entry}
+              stopLoss={selectedPlan?.stopLoss}
+              target1={selectedPlan?.target1}
+              target2={selectedPlan?.target2}
               />
             </div>
           </div>
 
           {/* AI Report */}
-          <div className="flex-1 overflow-hidden flex flex-col min-h-0" style={{ background: "var(--bg-panel)" }}>
+          <div className="flex-none md:flex-1 overflow-visible md:overflow-hidden flex flex-col min-h-0" style={{ background: "var(--bg-panel)" }}>
             <div className="px-3 py-2 border-b border-slate-800/40 flex items-center gap-2 flex-shrink-0">
               <div className="w-4 h-4 rounded flex items-center justify-center text-[9px] font-black"
-                style={{ background: "linear-gradient(135deg,#a855f7,#06b6d4)" }}>G</div>
-              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Gemini AI Analysis</span>
-              {analysis && !analysisLoading && (
+                style={{ background: "linear-gradient(135deg,#a855f7,#06b6d4)" }}>AI</div>
+              <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-widest">Research explanation</span>
+              {analysis && visibleAnalysis && !analysisLoading && !detailStock?.nearMiss && (
                 <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded border ${
                   analysis.verdictBadge === "STRONG BUY SETUP"  ? "bg-emerald-950/50 border-emerald-800 text-emerald-400" :
                   analysis.verdictBadge === "BUY ON DIP"        ? "bg-cyan-950/50 border-cyan-800 text-cyan-400" :
@@ -401,23 +819,28 @@ export default function Home() {
                 }`}>{analysis.verdictBadge}</span>
               )}
             </div>
-            <div className="flex-1 overflow-y-auto">
-              {analysisError && !analysisLoading ? (
-                <div className="m-4 rounded-xl border border-red-900/60 bg-red-950/30 p-4 text-sm text-red-300">
-                  <div className="font-semibold">AI analysis unavailable</div>
-                  <p className="mt-1 text-xs text-red-300/80">{analysisError}</p>
+            <div className="md:flex-1 md:overflow-y-auto">
+              {(analysisError || expiredExplanation) && !analysisLoading && (
+                <div role="status" className={"m-4 rounded-xl border p-4 text-sm " + (dataPaused || budgetPaused || expiredExplanation ? 'border-amber-900/60 bg-amber-950/30 text-amber-200' : 'border-red-900/60 bg-red-950/30 text-red-300')}>
+                  <div className="font-semibold">{dataPaused ? 'AI paused · stock data incomplete' : budgetPaused ? 'Daily AI limit reached' : expiredExplanation ? 'AI explanation expired' : 'AI analysis unavailable'}</div>
+                  <p className="mt-1 text-xs">{analysisError?.message ?? 'Refresh analysis to use current data. The chart and quant research are below.'}</p>
                   {selectedStock && (
                     <button
                       onClick={() => handleSelectStock(selectedStock)}
-                      className="mt-3 rounded-lg border border-red-800/70 px-3 py-1.5 text-xs font-semibold text-red-200 transition hover:bg-red-900/40"
+                      className="mt-3 rounded-lg border border-current px-3 py-1.5 text-xs font-semibold transition hover:bg-white/5"
                     >
-                      Retry analysis
+                      {dataPaused ? 'Recheck stock data' : 'Retry analysis'}
                     </button>
                   )}
                 </div>
-              ) : (
-                <AIReportCard analysis={analysis} stock={selectedStock} loading={analysisLoading} />
               )}
+                <AIReportCard
+                  analysis={visibleAnalysis}
+                  stock={detailStock}
+                  loading={analysisLoading}
+                  analysisMeta={visibleAnalysis ? analysisMeta : null}
+                  onRefresh={selectedStock ? () => { void handleSelectStock(selectedStock, true); } : undefined}
+                />
             </div>
           </div>
         </div>
@@ -427,9 +850,11 @@ export default function Home() {
       <footer className="flex-shrink-0 border-t border-slate-900 py-1 px-4 text-center"
         style={{ background: "rgba(4,7,15,0.9)" }}>
         <p className="text-[10px] text-slate-700">
-          DeepStocks · NSE/BSE Quant Screener · Powered by Gemini AI · Educational use only · Not SEBI-registered advice
+          DeepStocks · NSE Quant Screener · Quant research · Optional AI explanation · Educational use only · Not SEBI-registered advice
         </p>
       </footer>
     </div>
   );
 }
+
+export default function Home(){return <AccessGate><Dashboard/></AccessGate>;}

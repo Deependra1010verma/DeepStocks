@@ -3,10 +3,32 @@ import { connectDB } from './db';
 import {
   applyPortfolioAction,
   emptyPortfolio,
+  portfolioSessionOpening,
   type Portfolio,
-  type PortfolioAction
+  type PortfolioAction,
+  type PortfolioPriorCloses
 } from './portfolioEngine';
 import { AppError } from './operations';
+import { getCashSession } from './nseSessionData';
+import { getNsePriceBasisActions } from './nseCorporateEvents';
+
+export async function loadPortfolioPriorCloses(portfolio: Portfolio, now = new Date()): Promise<PortfolioPriorCloses | null> {
+  const opening = portfolioSessionOpening(portfolio, now);
+  if (!opening.carried?.length || !opening.priorSession) return null;
+  const session = opening.priorSession;
+  const [closes, actions] = await Promise.all([
+    getCashSession(session),
+    getNsePriceBasisActions(opening.session, opening.session)
+  ]);
+  const prices: Record<string, number> = {};
+  if (!actions) return { session, prices, issue:'Corporate-action coverage unavailable for opening equity' };
+  for (const [symbol] of opening.carried) {
+    if (actions.has(symbol)) return { session, prices, issue:`Opening equity requires corporate-action reconciliation for ${symbol}` };
+    const row = closes.get(symbol);
+    if (row) prices[symbol] = row.candle.close;
+  }
+  return { session, prices };
+}
 export async function readPortfolio(): Promise<Portfolio> {
   await connectDB();
   return (

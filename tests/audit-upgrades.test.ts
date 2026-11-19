@@ -359,6 +359,11 @@ it('rejects a holdout record whose inputs arrived after the decision', () => {
     cases: [row]
   };
   expect(replayHoldout(input).stats.winRate).toBeNull();
+  const split = replayHoldout({...input,cases:[{...row,bars:[
+    {...bar('2026-11-18T10:45:00+05:30',50), date:'2026-11-18T10:45:00+05:30', splitReported:true}
+  ]}]});
+  expect(split.outcomes[0].outcome.status).toBe('UNRESOLVED');
+  expect(split.stats.closed).toBe(0);
   expect(() =>
     replayHoldout({ ...input, cases: [{ ...row, inputsAvailableAt: '2026-11-19' }] })
   ).toThrow(/look-ahead/);

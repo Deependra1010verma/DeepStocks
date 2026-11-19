@@ -2,9 +2,9 @@
 import { useEffect, useState } from "react";
 import type { AIAnalysisResult } from "@/lib/aiAnalyst";
 import type { ScreenedStock } from "@/lib/screenerEngine";
-import { getTradePlan, positionSize, formatTradeSetup } from '@/lib/tradePlan';
+import { getTradePlan, positionSize, formatTradeSetup, type NumericTradePlan } from '@/lib/tradePlan';
 import { enforceRiskGuards } from '@/lib/analysisRules';
-import { portfolioSizing, type Portfolio } from '@/lib/portfolioEngine';
+import { portfolioSizing, type Portfolio, type PortfolioPriorCloses } from '@/lib/portfolioEngine';
 import { RVOL_SESSIONS } from '@/lib/relativeVolume';
 
 interface Props {
@@ -188,18 +188,18 @@ function QuickRef({ stock }: { stock: ScreenedStock }) {
   );
 }
 
-function PositionSizing({ stock, capital, setCapital, portfolio }: { stock: ScreenedStock; capital: string; setCapital: (value:string)=>void; portfolio:Portfolio|null }) {
-  const blocked=enforceRiskGuards({},stock).verdictBadge==='WATCHLIST ONLY';
-  const riskPercent = blocked ? 0 : (stock.positionRiskPercent ?? 0);
-  const sizing=positionSize(getTradePlan(stock),Number(capital),riskPercent);
-  const live=portfolio?portfolioSizing(portfolio,getTradePlan(stock),stock.sector,stock.symbol,riskPercent):null;
+function PositionSizing({ plan, capital, setCapital, live, riskPercent, blocked }: {
+  plan: NumericTradePlan | null; capital: string; setCapital: (value:string)=>void;
+  live: ReturnType<typeof portfolioSizing> | null; riskPercent: number; blocked: boolean
+}) {
+  const sizing = positionSize(plan, Number(capital), riskPercent);
   const maxQty=live?.quantity??0,capitalRequired=live?.cashRequired??0;
   return (
     <div className="rounded-xl border border-slate-800/60 bg-slate-900/30 p-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Risk-controlled sizing</div>
-          <div className="mt-1 text-xs text-slate-400">{blocked ? "Watchlist only — no entry quantity cleared" : live?.reasons.join('; ')||(!portfolio?'Configure/review your portfolio before clearing quantity':`${riskPercent.toFixed(1)}% planned risk; cash, sector and aggregate risk caps apply`)}</div>
+          <div className="mt-1 text-xs text-slate-400">{blocked ? "Watchlist only — no entry quantity cleared" : live?.reasons.join('; ')||(!live?'Configure/review your portfolio before clearing quantity':`${riskPercent.toFixed(1)}% planned risk · portfolio limits apply`)}</div>
         </div>
         <label className="flex items-center gap-2 text-[10px] text-slate-500">
           What-if capital
@@ -266,12 +266,12 @@ function cacheAgeLabel(value: string) {
 export default function AIReportCard({ analysis, stock, loading, analysisMeta, onRefresh }: Props) {
   const [copied, setCopied] = useState(false);
   const [capital,setCapital]=useState("90000");
-  const [portfolio,setPortfolio]=useState<Portfolio|null>(null);
+  const [portfolioView,setPortfolioView]=useState<{portfolio:Portfolio;dailyCloses?:PortfolioPriorCloses|null}|null>(null);
   const [reserveMessage,setReserveMessage]=useState('');
   const activeSymbol=stock?.symbol;
   useEffect(()=>{
     let active=true;
-    const read=async()=>{try{const r=await fetch('/api/portfolio',{signal:AbortSignal.timeout(12000)});if(!r.ok)throw new Error();const d=await r.json();if(active)setPortfolio(d.portfolio??null);}catch{if(active)setPortfolio(null);}};
+    const read=async()=>{try{const r=await fetch('/api/portfolio',{signal:AbortSignal.timeout(14000)});if(!r.ok)throw new Error();const d=await r.json();if(active)setPortfolioView(d.portfolio?d:null);}catch{if(active)setPortfolioView(null);}};
     if(activeSymbol)void read();window.addEventListener('portfolio-updated',read);
     return()=>{active=false;window.removeEventListener('portfolio-updated',read);};
   },[activeSymbol]);
@@ -288,7 +288,11 @@ export default function AIReportCard({ analysis, stock, loading, analysisMeta, o
   const latestCandle = stock.candles.at(-1);
   const relativeVolume = stock.relativeVolume;
   const numericPlan=getTradePlan(stock);
-  const qty=portfolio?portfolioSizing(portfolio,numericPlan,stock.sector,stock.symbol,analysis.verdictBadge==='WATCHLIST ONLY'?0:(stock.positionRiskPercent??0)).quantity:0;
+  const portfolio=portfolioView?.portfolio;
+  const blocked = analysis.verdictBadge === 'WATCHLIST ONLY';
+  const riskPercent = blocked ? 0 : (stock.positionRiskPercent ?? 0);
+  const liveSizing = portfolio ? portfolioSizing(portfolio,numericPlan,stock.sector,stock.symbol,riskPercent,undefined,portfolioView.dailyCloses) : null;
+  const qty = liveSizing?.quantity ?? 0;
   const tradingViewUrl = `https://www.tradingview.com/symbols/NSE-${encodeURIComponent(symbol)}/`;
 
   const copySetup = async () => {
@@ -384,12 +388,12 @@ export default function AIReportCard({ analysis, stock, loading, analysisMeta, o
 
       {/* ── Trade Plan ── */}
       {!researchOnly && <TradePlanCard plan={tradePlan} />}
-      {numericPlan&&<div className="rounded-xl border border-slate-800 p-3 text-xs text-slate-400 space-y-2"><p className="text-cyan-300">Entry trigger: {numericPlan.trigger}</p><p>{numericPlan.invalidation}</p><p>Entry expires {new Date(numericPlan.validUntil).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST · net T1 reward/risk {numericPlan.netRiskReward.toFixed(2)} · minimum policy {numericPlan.minimumNetRR.toFixed(2)}</p><p>{numericPlan.tickSize?`Instrument tick ₹${numericPlan.tickSize}`:'Instrument tick unverified — levels are indicative; verify the broker instrument before entry.'} · Cost/slippage assumptions require broker reconciliation.</p>{portfolio&&qty>0&&<button className="text-cyan-300" onClick={async()=>{try{const r=await fetch('/api/portfolio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:portfolio.version,action:{id:crypto.randomUUID(),type:'reserve',symbol:stock.symbol,mode:stock.mode,quantity:qty}}),signal:AbortSignal.timeout(45000)}),d=await r.json();if(!r.ok)throw new Error(d.error);setPortfolio(d.portfolio);setReserveMessage('Cash/risk reserved in your journal. No broker order was sent.');window.dispatchEvent(new Event('portfolio-updated'));}catch(e){setReserveMessage(e instanceof Error?e.message:'Reservation failed');}}}>Reserve {qty} shares in journal</button>}{reserveMessage&&<p role="status">{reserveMessage}</p>}</div>}
+      {numericPlan&&<div className="rounded-xl border border-slate-800 p-3 text-xs text-slate-400 space-y-2"><p className="text-cyan-300">Entry trigger: {numericPlan.trigger}</p><p>{numericPlan.invalidation}</p><p>Entry expires {new Date(numericPlan.validUntil).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST · net T1 reward/risk {numericPlan.netRiskReward.toFixed(2)} · minimum policy {numericPlan.minimumNetRR.toFixed(2)}</p><p>{numericPlan.tickSize?`Instrument tick ₹${numericPlan.tickSize}`:'Instrument tick unverified — levels are indicative; verify the broker instrument before entry.'} · Cost/slippage assumptions require broker reconciliation.</p>{portfolio&&qty>0&&<button className="text-cyan-300" onClick={async()=>{try{const r=await fetch('/api/portfolio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:portfolio.version,action:{id:crypto.randomUUID(),type:'reserve',symbol:stock.symbol,mode:stock.mode,quantity:qty}}),signal:AbortSignal.timeout(45000)}),d=await r.json();if(!r.ok)throw new Error(d.error);setPortfolioView(d);setReserveMessage('Cash/risk reserved in your journal. No broker order was sent.');window.dispatchEvent(new Event('portfolio-updated'));}catch(e){setReserveMessage(e instanceof Error?e.message:'Reservation failed');}}}>Reserve {qty} shares in journal</button>}{reserveMessage&&<p role="status">{reserveMessage}</p>}</div>}
 
       {/* ── Quick Levels ── */}
       {!researchOnly && <QuickRef stock={stock} />}
 
-      {!researchOnly && <PositionSizing stock={stock} capital={capital} setCapital={setCapital} portfolio={portfolio} />}
+      {!researchOnly && <PositionSizing plan={numericPlan} capital={capital} setCapital={setCapital} live={liveSizing} riskPercent={riskPercent} blocked={blocked} />}
 
       {analysis.evidence&&<details className="rounded-xl border border-slate-800 p-3 text-xs"><summary className="cursor-pointer text-cyan-300">Evidence, periods & sources</summary><div className="mt-3 space-y-3">{analysis.evidence.map(f=><div key={f.id}><p className="text-slate-300">{f.text}</p><p className="text-slate-500">{f.status} · As of {f.asOf?new Date(f.asOf).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})+' IST':'unavailable'} · <a href={f.source} target="_blank" rel="noreferrer" className="text-cyan-400">Source</a></p></div>)}</div></details>}
 

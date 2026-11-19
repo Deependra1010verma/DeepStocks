@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authorizeRequest, requireOwner, readBody, apiError } from '@/lib/apiSecurity';
-import { readPortfolio, savePortfolioAction } from '@/lib/portfolioService';
+import { loadPortfolioPriorCloses, readPortfolio, savePortfolioAction } from '@/lib/portfolioService';
 import {
   portfolioSizing,
   portfolioTotals,
   positionReview,
-  type PortfolioAction
+  type PortfolioAction,
+  type Portfolio,
+  type PortfolioPriorCloses
 } from '@/lib/portfolioEngine';
 import { validMode, validSymbol, resolveStock } from '@/lib/stockService';
 import { getTradePlan } from '@/lib/tradePlan';
@@ -16,6 +18,21 @@ import { NSE_SCAN_UNIVERSE } from '@/lib/niftyStocks';
 import { reviewPortfolioExchange } from '@/lib/portfolioExchangeReview';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
+
+function readDailyCloses(portfolio: Portfolio) {
+  return beforeDeadline(() => loadPortfolioPriorCloses(portfolio), Date.now() + 5200).catch(() => null);
+}
+async function portfolioPayload(portfolio: Portfolio, checkedCloses?: PortfolioPriorCloses | null) {
+  const dailyCloses = checkedCloses === undefined ? await readDailyCloses(portfolio) : checkedCloses;
+  const now = new Date();
+  return {
+    portfolio,
+    dailyCloses,
+    totals: portfolioTotals(portfolio, now, dailyCloses),
+    reviews: portfolio.positions.map(p => ({id:p.id, actions:positionReview(p, now)}))
+  };
+}
+
 export async function GET(req: NextRequest) {
   try {
     requireOwner(req);
@@ -25,11 +42,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ exchangeReviews }, { headers: { 'Cache-Control': 'no-store' } });
     }
     return NextResponse.json(
-      {
-        portfolio,
-        totals: portfolioTotals(portfolio),
-        reviews: portfolio.positions.map((p) => ({ id: p.id, actions: positionReview(p) }))
-      },
+      await portfolioPayload(portfolio),
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (e) {
@@ -43,6 +56,7 @@ export async function POST(req: NextRequest) {
     if (!Number.isInteger(body.version) || typeof body.action !== 'object' || !body.action)
       throw new AppError('INVALID_REQUEST', 'Version and portfolio action required.', 400);
     let action = body.action as PortfolioAction;
+    let checkedCloses: PortfolioPriorCloses | null | undefined;
     if (action.type === 'fill') {
       const symbol = validSymbol(action.symbol),
         mode = validMode(action.mode);
@@ -58,6 +72,10 @@ export async function POST(req: NextRequest) {
       const stock = await resolveStock(validSymbol(input.symbol), validMode(input.mode)),
         plan = getTradePlan(stock),
         portfolio = await readPortfolio();
+      if (portfolio.version !== body.version) {
+        throw new AppError('PORTFOLIO_CHANGED', 'Portfolio changed in another tab. Reload before applying this update.', 409);
+      }
+      checkedCloses = await readDailyCloses(portfolio);
       const sizing = portfolioSizing(
         portfolio,
         plan,
@@ -65,7 +83,9 @@ export async function POST(req: NextRequest) {
         stock.symbol,
         enforceRiskGuards({}, stock).verdictBadge === 'WATCHLIST ONLY'
           ? 0
-          : (stock.positionRiskPercent ?? 0)
+          : (stock.positionRiskPercent ?? 0),
+        new Date(),
+        checkedCloses
       );
       const quantity = Number(input.quantity);
       if (!plan || !Number.isInteger(quantity) || quantity <= 0 || quantity > sizing.quantity)
@@ -94,11 +114,7 @@ export async function POST(req: NextRequest) {
       Date.now() + 10000
     );
     return NextResponse.json(
-      {
-        portfolio,
-        totals: portfolioTotals(portfolio),
-        reviews: portfolio.positions.map((p) => ({ id: p.id, actions: positionReview(p) }))
-      },
+      await portfolioPayload(portfolio, checkedCloses),
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (e) {

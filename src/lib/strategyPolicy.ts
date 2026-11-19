@@ -5,9 +5,18 @@ import {
   nextMarketOpen,
   shiftDate,
   calendarDay,
-  cashSessionLimits
+  cashSessionLimits,
+  sessionTime
 } from './timezone';
-export const STRATEGY_VERSION = '2026-11-risk-v6';
+export const STRATEGY_VERSION = '2026-11-risk-v9';
+
+export function qualifiesForShortlist(stock: Pick<ScreenedStock, 'nearMiss' | 'researchQualified'>): boolean {
+  return !stock.nearMiss || stock.researchQualified === true;
+}
+
+export function requiresOvernightClearance(mode: ScreenerMode) {
+  return mode !== 'intraday' && mode !== 'longterm';
+}
 export const STRATEGY_POLICIES: Record<
   ScreenerMode,
   { trigger: string; minNetRR: number; entrySessions: number }
@@ -57,17 +66,19 @@ export function entryExpiry(
 ): string {
   const reference =
     referenceAt && Number.isFinite(Date.parse(referenceAt)) ? new Date(referenceAt) : now;
-  let day = dateToISTString(reference);
+  const referenceDay = dateToISTString(reference);
+  let day = referenceDay;
   if (getMarketSession(reference, casEligible).state !== 'LIVE')
     day = dateToISTString(nextMarketOpen(reference));
+  if (!calendarDay(day).trading) return reference.toISOString();
   let remaining = STRATEGY_POLICIES[mode].entrySessions - 1;
   for (let i = 0; remaining > 0 && i < 20; i++) {
     day = shiftDate(day, 1);
     if (!calendarDay(day).verified) return reference.toISOString();
     if (calendarDay(day).trading) remaining--;
   }
-  const close = cashSessionLimits(day, casEligible).continuousEnd;
-  return new Date(+new Date(`${day}T00:00:00+05:30`) + close * 60_000).toISOString();
+  const close = cashSessionLimits(day, day === referenceDay ? casEligible : null).continuousEnd;
+  return sessionTime(day, close).toISOString();
 }
 export function tradeCosts(entry: number, stop: number, target: number, costBps = 20, slippageBps = 5) {
   const fee = (entry * costBps) / 10000,

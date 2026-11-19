@@ -1,21 +1,22 @@
-import { getMarketSession, nextMarketOpen, dateToISTString, cashSessionLimits } from './timezone';
+import { getMarketSession, nextMarketOpen, dateToISTString, cashSessionLimits, sessionTime } from './timezone';
 import type { ScreenerMode, ScreenedStock } from './screenerEngine';
-export const ANALYSIS_VERSION = '2026-11-evidence-v9';
-export function getAIExpiry(mode: ScreenerMode, now = new Date()): Date {
-  if (!getMarketSession(now).calendarVerified) return new Date(now.getTime());
-  if (getMarketSession(now).state !== 'LIVE') return nextMarketOpen(now);
+export const ANALYSIS_VERSION = '2026-11-evidence-v13';
+export function getAIExpiry(mode: ScreenerMode, now = new Date(), casEligible: boolean | null = null): Date {
+  const session = getMarketSession(now, casEligible);
+  if (!session.calendarVerified || session.state === 'UNKNOWN') return new Date(now.getTime());
+  if (session.state !== 'LIVE') return nextMarketOpen(now);
   const duration =
     mode === 'intraday'
       ? 900000
       : ['btst', 'swing_breakout', 'swing_pullback'].includes(mode)
         ? 3600000
         : 14400000;
-  const day = dateToISTString(now),
-    close = new Date(`${day}T00:00:00+05:30`).getTime() + cashSessionLimits(day).continuousEnd * 60000;
+  const day = dateToISTString(now), limits = cashSessionLimits(day, casEligible),
+    close = +sessionTime(day, limits.continuousEnd), open = +sessionTime(day, limits.continuousStart);
   return new Date(
     Math.min(
       mode === 'intraday'
-        ? (Math.floor(now.getTime() / duration) + 1) * duration
+        ? open + (Math.floor((now.getTime() - open) / duration) + 1) * duration
         : now.getTime() + duration,
       close
     )
@@ -44,6 +45,10 @@ export function guardFingerprint(stock: ScreenedStock): string {
     stock.earningsRisk,
     stock.eventStatus,
     stock.exchangeEvents,
+    stock.referenceCoverage?.earnings?.status,
+    stock.referenceCoverage?.actions?.status,
+    stock.referenceCoverage?.asm?.status,
+    stock.referenceCoverage?.gsm?.status,
     stock.eventConflict,
     stock.surveillance,
     stock.exchangePriceBand,
@@ -53,8 +58,11 @@ export function guardFingerprint(stock: ScreenedStock): string {
     stock.extensionWarning,
     stock.weeklyTrend,
     stock.defensiveMode,
+    stock.regime,
     stock.positionRiskPercent,
     stock.dataQuality?.stale,
+    stock.dataQuality?.delayMinutes,
+    stock.dataQuality?.sessionEligibility,
     stock.dataQuality?.candleAt,
     stock.dataQuality?.candleSource,
     stock.dataQuality?.restoredCashSessions,

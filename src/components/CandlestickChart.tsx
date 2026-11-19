@@ -15,6 +15,7 @@ import { OHLCV } from "@/lib/indicators";
 
 interface Props {
   candles: OHLCV[];
+  interval: "15m" | "1d";
   ema20: number;
   ema50: number;
   ema200: number;
@@ -61,19 +62,15 @@ function formatIST(date: Date, withTime: boolean): string {
   }).format(date);
 }
 
-export default function CandlestickChart({ candles, symbol, entryPrice, stopLoss, target1, target2 }: Props) {
+export default function CandlestickChart({ candles, interval, symbol, entryPrice, stopLoss, target1, target2 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const timestamps = candles
-    .map((c) => Math.floor(new Date(c.date).getTime() / 1000))
-    .filter((ts) => Number.isFinite(ts))
-    .sort((a, b) => a - b);
-  const latestTimestamp = timestamps[timestamps.length - 1];
-  const previousTimestamp = timestamps[timestamps.length - 2];
-  const chartIsIntraday = typeof latestTimestamp === "number" &&
-    typeof previousTimestamp === "number" &&
-    latestTimestamp - previousTimestamp < 86400;
-  const chartLatestDate = typeof latestTimestamp === "number" ? new Date(latestTimestamp * 1000) : null;
+  const isIntraday = interval === "15m";
+  const latestTimestamp = candles.reduce((latest, candle) => {
+    const timestamp = new Date(candle.date).getTime();
+    return timestamp > latest ? timestamp : latest;
+  }, -Infinity);
+  const chartLatestDate = Number.isFinite(latestTimestamp) ? new Date(latestTimestamp) : null;
 
   useEffect(() => {
     if (!containerRef.current || candles.length === 0) return;
@@ -87,11 +84,6 @@ export default function CandlestickChart({ candles, symbol, entryPrice, stopLoss
     }
     const sortedEntries = Array.from(byTime.entries()).sort((a, b) => a[0] - b[0]);
     if (sortedEntries.length === 0) return;
-
-    const intervalSeconds = sortedEntries.length > 1
-      ? sortedEntries[sortedEntries.length - 1][0] - sortedEntries[sortedEntries.length - 2][0]
-      : 86400;
-    const isIntraday = intervalSeconds < 86400;
 
     if (chartRef.current) {
       chartRef.current.remove();
@@ -120,7 +112,7 @@ export default function CandlestickChart({ candles, symbol, entryPrice, stopLoss
       },
       timeScale: {
         borderColor: "#1a2740",
-        timeVisible: true,
+        timeVisible: isIntraday,
         secondsVisible: false,
         tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) => {
           const date = asDate(time);
@@ -238,7 +230,7 @@ export default function CandlestickChart({ candles, symbol, entryPrice, stopLoss
         chartRef.current = null;
       }
     };
-  }, [candles, entryPrice, stopLoss, symbol, target1, target2]);
+  }, [candles, entryPrice, isIntraday, stopLoss, symbol, target1, target2]);
 
   if (candles.length === 0) {
     return (
@@ -253,11 +245,11 @@ export default function CandlestickChart({ candles, symbol, entryPrice, stopLoss
       <div ref={containerRef} className="w-full h-full" />
       {candles.length > 0 && (
         <div className="absolute top-2 right-2 rounded-md border border-slate-800/70 bg-slate-950/85 px-2 py-1 text-[10px] font-mono text-slate-500 backdrop-blur-sm">
-          <span className="text-cyan-400">{chartIsIntraday ? "15m" : "1D"} · IST</span>
+          <span className="text-cyan-400">{isIntraday ? "15m" : "1D"} · IST</span>
           <span className="mx-1 text-slate-700">·</span>
-          {chartIsIntraday ? "Latest available" : "Latest close"}
+          {isIntraday ? "Latest available" : "Latest close"}
           <span className="mx-1 text-slate-700">·</span>
-          {chartLatestDate ? formatIST(chartLatestDate, chartIsIntraday) : "—"}
+          {chartLatestDate ? formatIST(chartLatestDate, isIntraday) : "—"}
         </div>
       )}
       {/* EMA Legend */}

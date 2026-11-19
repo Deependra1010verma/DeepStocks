@@ -1,4 +1,5 @@
 import { expect, it, vi } from 'vitest';
+import { assessDataQuality } from '../src/lib/dataQuality';
 import {
   confirmBtstMomentum,
   confirmDailyReversal,
@@ -7,10 +8,53 @@ import {
 import { mergeExchangeClose, parseCashSession, parseIndexSession, restoreCashSpecialSessions } from '../src/lib/nseSessionData';
 import { entryExpiry, tradeCosts } from '../src/lib/strategyPolicy';
 import { getTradePlan } from '../src/lib/tradePlan';
+import { rankSectorCandidates } from '../src/lib/riskGuards';
+import { getMarketSession, isCompletedMarketPeriod, isContinuous15mBar, latestCompletedSession, nextMarketOpen } from '../src/lib/timezone';
 import { bar, NOW, stock } from './fixtures';
 
 const day = '2026-11-18';
 const ist = (time: string) => new Date(`${day}T${time}:00+05:30`);
+
+it('requires a closing quote even when the daily candle is dated correctly', () => {
+  const nextMorning = new Date('2026-11-19T08:00:00+05:30');
+  expect(assessDataQuality(ist('10:00'), ist('09:15'), 0, false, nextMorning).stale).toBe(true);
+  expect(assessDataQuality(ist('15:35'), ist('09:15'), 0, false, nextMorning).stale).toBe(false);
+});
+
+it('uses the non-CAS BTST window during the mixed close', () => {
+  const bars = [candle('14:45', 100), candle('15:00', 103, 100)];
+  expect(confirmBtstMomentum(bars, ist('15:20').toISOString(), ist('15:20'), false)?.level).toBe(100);
+  expect(confirmBtstMomentum(bars, ist('15:20').toISOString(), ist('15:20'), true)).toBeNull();
+  expect(confirmBtstMomentum(bars, ist('15:20').toISOString(), ist('15:20'))).toBeNull();
+  for (const date of ['2026-07-31','2026-12-07']) {
+    const at = new Date(date+'T15:20:00+05:30');
+    const datedBars = bars.map((bar, index) => ({...bar,date: new Date(date+(index===0?'T14:45:00+05:30':'T15:00:00+05:30'))}));
+    expect(confirmBtstMomentum(datedBars, at.toISOString(), at, true)?.level).toBe(100);
+  }
+});
+
+it('closes Yahoo weekly buckets at the last published cash session', () => {
+  const monday = new Date('2026-11-15T18:30:00Z');
+  expect(isCompletedMarketPeriod(monday,'1wk',new Date('2026-11-20T15:34:59+05:30'))).toBe(false);
+  expect(isCompletedMarketPeriod(monday,'1wk',new Date('2026-11-20T15:35:00+05:30'))).toBe(true);
+  const holidayWeek = new Date('2026-03-29T18:30:00Z');
+  expect(isCompletedMarketPeriod(holidayWeek,'1wk',new Date('2026-04-02T15:30:00+05:30'))).toBe(true);
+  const muhuratWeek = new Date('2026-11-01T18:30:00Z');
+  expect(isCompletedMarketPeriod(muhuratWeek,'1wk',new Date('2026-11-06T16:00:00+05:30'))).toBe(false);
+  expect(isCompletedMarketPeriod(muhuratWeek,'1wk',new Date('2026-11-08T15:35:00+05:30'))).toBe(true);
+  expect(isCompletedMarketPeriod(monday,'1mo',new Date('2026-11-30T15:35:00+05:30'))).toBe(true);
+});
+
+it('counts both special cash sessions and keeps unknown years closed to evidence', () => {
+  const time = (day: string, minute: string) => new Date(`${day}T${minute}:00+05:30`);
+  expect(getMarketSession(time('2026-02-01','09:15')).state).toBe('LIVE');
+  expect(nextMarketOpen(time('2026-11-06','16:00'))).toEqual(time('2026-11-08','14:20'));
+  expect(getMarketSession(time('2026-11-08','14:10')).state).toBe('PRE_OPEN');
+  expect(isContinuous15mBar(time('2026-11-08','14:20'))).toBe(true);
+  expect(isContinuous15mBar(time('2026-11-08','14:15'))).toBe(false);
+  expect(latestCompletedSession(time('2026-11-09','08:00'))).toBe('2026-11-08');
+  expect(latestCompletedSession(time('2027-01-01','08:00'))).toBeNull();
+});
 function candle(time: string, close: number, low = close - 1) {
   return { ...bar(ist(time).toISOString(), close), open: close - 0.5, high: close + 0.1, low };
 }
@@ -31,7 +75,7 @@ it('accepts a confirmed intraday breakout across consecutive completed bars', ()
 
 it('requires a completed momentum candle inside the dated BTST window', () => {
   const candles = [candle('14:15', 100), candle('14:30', 101)];
-  expect(confirmBtstMomentum(candles, ist('14:46').toISOString(), ist('14:46'))?.level).toBe(100);
+  expect(confirmBtstMomentum(candles, ist('14:46').toISOString(), ist('14:46'), true)?.level).toBe(100);
   expect(confirmBtstMomentum(candles, ist('14:44').toISOString(), ist('14:46'))).toBeNull();
   expect(confirmBtstMomentum(candles, ist('15:15').toISOString(), ist('15:15'))).toBeNull();
   expect(confirmBtstMomentum(candles.slice(-1), ist('14:46').toISOString(), ist('14:46'))).toBeNull();
@@ -77,8 +121,20 @@ it('sets expiry using the continuous cash close for the instrument and date', ()
   expect(entryExpiry('btst', '2026-12-07T15:00:00+05:30')).toBe('2026-12-07T10:00:00.000Z');
 });
 
-it('keeps a long-term research qualifier out of the mechanical trade plan', () => {
-  expect(getTradePlan(stock({ mode: 'longterm', researchQualified: true, nearMiss: true }))).toBeNull();
+it('ranks two Long-Term research qualifiers per sector without granting a mechanical trade plan', () => {
+  const research = [70, 90, 80].map(score => stock({
+    symbol: `RESEARCH${score}.NS`,
+    mode: 'longterm',
+    researchQualified: true,
+    nearMiss: true,
+    positionRiskPercent: 0,
+    quantScore: score,
+  }));
+  const rejected = { ...research[0], symbol: 'REJECTED.NS', researchQualified: false, quantScore: 99 };
+  const results = rankSectorCandidates([...research, rejected]);
+  expect(results.map(s => s.symbol)).toEqual(['RESEARCH90.NS', 'RESEARCH80.NS', 'RESEARCH70.NS', 'REJECTED.NS']);
+  expect(results.map(s => s.primaryRank)).toEqual([true, true, false, false]);
+  expect(results.every(s => s.sectorCluster && s.nearMiss && s.positionRiskPercent === 0 && getTradePlan(s) === null)).toBe(true);
 });
 
 it('parses and joins exact-session NSE cash equity with a matching prior close', () => {
@@ -93,6 +149,7 @@ it('parses and joins exact-session NSE cash equity with a matching prior close',
   expect([...data.keys()]).toEqual(['SUNTV.NS']);
   const official = data.get('SUNTV.NS')!;
   expect(mergeExchangeClose([bar('2026-11-17', 659.7)], official, day)?.at(-1)?.close).toBe(696.35);
+  expect(mergeExchangeClose([bar('2026-11-17', 659.7), {...bar(day, 696.35),splitReported:true}], official, day)).toBeNull();
   expect(mergeExchangeClose([bar('2026-11-17', 600)], official, day)).toBeNull();
   expect(mergeExchangeClose([bar('2026-11-16', 659.7)], official, day)).toBeNull();
 });

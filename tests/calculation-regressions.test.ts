@@ -5,7 +5,66 @@ import { assessDataQuality } from '../src/lib/dataQuality';
 import { evaluatePaperSignal, PAPER_EVALUATION_VERSION, summarizePaperSignals, type PaperSignal } from '../src/lib/ledgerEngine';
 import { stock, bar, NOW } from './fixtures';
 import type { StockData } from '../src/lib/dataFetcher';
+import { calcATR, calcEMA, calcRSI } from '../src/lib/indicators';
+import { getMarketSession, sessionTime, type MarketSession } from '../src/lib/timezone';
 afterEach(() => vi.useRealTimers());
+
+it('matches independent EMA and Wilder calculations on identical candles', () => {
+  const candles = Array.from({ length: 600 }, (_, i) => {
+    const close = 100 + 0.04 * i + 5 * Math.sin(0.23 * i) + 2 * Math.cos(0.71 * i);
+    return { ...bar(new Date(Date.UTC(2025, 0, 1 + i)).toISOString(), close), open: close - 0.3,
+      high: close + 1.1, low: close - 1.7 };
+  });
+  const closes = candles.map(candle => candle.close);
+  const changes = closes.slice(1).map((close, i) => close - closes[i]);
+  const ranges = candles.slice(1).map(({ high, low }, i) =>
+    Math.max(high - low, Math.abs(high - closes[i]), Math.abs(low - closes[i])));
+
+  function smooth(values: number[], period: number, weight: number) {
+    let average = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+    return [average, ...values.slice(period).map(value => {
+      average = (1 - weight) * average + weight * value;
+      return average;
+    })];
+  }
+  function maxError(actual: number[], expected: number[]) {
+    expect(actual).toHaveLength(expected.length);
+    return Math.max(...actual.map((value, i) => Math.abs(value - expected[i])));
+  }
+  for (const period of [20, 50, 200]) {
+    expect(maxError(calcEMA(closes, period), smooth(closes, period, 2 / (period + 1)))).toBeLessThan(1e-10);
+  }
+  const gains = smooth(changes.map(change => Math.max(change, 0)), 14, 1 / 14);
+  const losses = smooth(changes.map(change => Math.max(-change, 0)), 14, 1 / 14);
+  const relativeStrength = gains.map((gain, i) => Number((100 * gain / (gain + losses[i])).toFixed(2)));
+  expect(maxError(calcRSI(closes), relativeStrength)).toBeLessThan(1e-10);
+  expect(maxError(calcATR(candles), smooth(ranges, 14, 1 / 14))).toBeLessThan(1e-10);
+});
+
+const rvolBoundaries: [string, number, number, MarketSession['state'], number][] = [
+  ['2026-11-18', 555, 539, 'CLOSED', 0],
+  ['2026-11-18', 555, 554, 'PRE_OPEN', 0],
+  ['2026-11-18', 555, 555, 'LIVE', 0],
+  ['2026-11-18', 555, 635, 'LIVE', 5],
+  ['2026-11-18', 555, 930, 'CLOSED', 25],
+  ['2026-11-18', 555, 960, 'CLOSED', 25],
+  ['2026-11-24', 555, 635, 'CLOSED', 0],
+  ['2026-11-08', 860, 875, 'LIVE', 0],
+  ['2027-01-04', 555, 635, 'UNKNOWN', 0],
+];
+
+it.each(rvolBoundaries)('reconciles session and intraday RVOL at %s from slot %i through minute %i', (day, open, minute, state, completed) => {
+  const prior = ['2026-10-19', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-26', '2026-10-27',
+    '2026-10-28', '2026-10-29', '2026-10-30', '2026-11-02'];
+  const history = [...prior, day].flatMap(date => Array.from({ length: 25 }, (_, slot) =>
+    bar(sessionTime(date, (date === day ? open : 555) + slot * 15).toISOString(), 100, date === day ? 200 : 100)));
+  const at = sessionTime(day, minute);
+  expect(getMarketSession(at, false)).toMatchObject({ state, calendarVerified: state !== 'UNKNOWN' });
+  const result = computeRVOL(history, 999999, true, at, at, false);
+  if (!completed) expect(result).toBeNull();
+  else expect(result).toMatchObject({ value: 2, volume: completed * 200, averageVolume: completed * 100,
+    through: sessionTime(day, open + completed * 15).toISOString() });
+});
 
 it('does not rename a short-period EMA as EMA200', () => {
   const s = stock(), candles = s.candles.slice(-60);

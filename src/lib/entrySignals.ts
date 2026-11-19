@@ -10,16 +10,16 @@ import {
 
 const BAR_MS = 15 * 60_000;
 
-function completedSessionBars(candles: OHLCV[], quoteAt: string | null | undefined, now: Date) {
+function completedSessionBars(candles: OHLCV[], quoteAt: string | null | undefined, now: Date, casEligible: boolean | null) {
   const cutoff = quoteAt ? Math.min(+now, Date.parse(quoteAt)) : NaN;
   const day = dateToISTString(now);
-  if (getMarketSession(now).state !== 'LIVE' || !Number.isFinite(cutoff)) return [];
+  if (getMarketSession(now, casEligible).state !== 'LIVE' || !Number.isFinite(cutoff)) return [];
   const bars = candles.filter((bar) => {
     const at = new Date(bar.date);
     return (
       +at + BAR_MS <= cutoff &&
       dateToISTString(at) === day &&
-      isContinuous15mBar(at)
+      isContinuous15mBar(at, casEligible)
     );
   });
   const latest = bars.at(-1);
@@ -33,9 +33,10 @@ function consecutive(bars: OHLCV[]) {
 export function confirmIntradayBreakout(
   candles: OHLCV[],
   quoteAt: string | null | undefined,
-  now = new Date()
+  now = new Date(),
+  casEligible: boolean | null = null
 ) {
-  const bars = completedSessionBars(candles, quoteAt, now);
+  const bars = completedSessionBars(candles, quoteAt, now, casEligible);
   if (bars.length < 4 || !consecutive(bars.slice(-4))) return null;
   const signal = bars.at(-1)!;
   const prior = bars.slice(-4, -1);
@@ -44,23 +45,24 @@ export function confirmIntradayBreakout(
     ? { at: new Date(signal.date).toISOString(), level }
     : null;
 }
-export function isBtstWindow(now = new Date()) {
-  const close = cashSessionLimits(dateToISTString(now)).continuousEnd;
+export function isBtstWindow(now = new Date(), casEligible: boolean | null = null) {
+  const close = cashSessionLimits(dateToISTString(now), casEligible).continuousEnd;
   return (
-    getMarketSession(now).state === 'LIVE' && minutesIST(now) >= close - 30 && minutesIST(now) < close
+    getMarketSession(now, casEligible).state === 'LIVE' && minutesIST(now) >= close - 30 && minutesIST(now) < close
   );
 }
 export function confirmBtstMomentum(
   candles: OHLCV[],
   quoteAt: string | null | undefined,
-  now = new Date()
+  now = new Date(),
+  casEligible: boolean | null = null
 ) {
-  if (!isBtstWindow(now)) return null;
-  const bars = completedSessionBars(candles, quoteAt, now);
+  if (!isBtstWindow(now, casEligible) || (casEligible === null && !isBtstWindow(now, false))) return null;
+  const bars = completedSessionBars(candles, quoteAt, now, casEligible);
   const signal = bars.at(-1),
     prior = bars.at(-2);
   if (!signal || !prior || signal.high <= signal.low || !consecutive([prior, signal])) return null;
-  const close = cashSessionLimits(dateToISTString(now)).continuousEnd;
+  const close = cashSessionLimits(dateToISTString(now), casEligible ?? false).continuousEnd;
   const time = minutesIST(new Date(signal.date)) + 15;
   const closingStrength = (signal.close - signal.low) / (signal.high - signal.low);
   return time >= close - 30 &&
@@ -70,8 +72,8 @@ export function confirmBtstMomentum(
     ? { at: new Date(signal.date).toISOString(), level: signal.low, closingStrength }
     : null;
 }
-export function confirmDailyReversal(candles: OHLCV[], period: 20 | 50, atr: number, now = new Date()) {
-  const session = latestCompletedSession(now);
+export function confirmDailyReversal(candles: OHLCV[], period: 20 | 50, atr: number, now = new Date(), casEligible: boolean | null = null) {
+  const session = latestCompletedSession(now, casEligible);
   if (!session || !(atr > 0)) return null;
   const completed = candles.filter((bar) => dateToISTString(new Date(bar.date)) <= session);
   const signal = completed.at(-1);

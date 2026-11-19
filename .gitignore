@@ -47,6 +47,8 @@ next-env.d.ts
 # local audit reports and artifacts
 /audit/
 /AUDIT*.md
+/docs/DEEPSTOCKS_AUDIT.md
+/docs/DEEPSTOCKS_FIX_PLAN.md
 /FIXES-SCANNING-*.md
 /RESEARCH-GROQ-*.md
 /UPGRADE-BACKLOG.md

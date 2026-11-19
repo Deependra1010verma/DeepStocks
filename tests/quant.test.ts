@@ -9,8 +9,21 @@ import { enforceRiskGuards } from '../src/lib/analysisRules';
 import { evaluateFundamentalQuality } from '../src/lib/fundamentalQuality';
 import { bar,stock,NOW } from './fixtures';
 afterEach(()=>vi.useRealTimers());
+
+it('requires comparable fiscal years and routes NBFC to financial-sector review', () => {
+  const annual = [2024,2025,2026].map((year,i) => ({
+    date: `${year}-03-31`, revenue: 100+i, profit:10, operatingCashFlow:20, debt:0, equity:100, shares:100
+  }));
+  expect(evaluateFundamentalQuality(annual,'IT',NOW)).toEqual([]);
+  expect(evaluateFundamentalQuality(annual,'NBFC',NOW)).toContain('Financial-sector capital adequacy, asset quality and valuation review required');
+  expect(evaluateFundamentalQuality([{...annual[0],date:'2018-03-31'},{...annual[1],date:'2021-03-31'},annual[2]],'IT',NOW)).not.toEqual([]);
+  expect(evaluateFundamentalQuality([...annual.slice(0,2),{...annual[2],profit:NaN}],'IT',NOW)).not.toEqual([]);
+  expect(evaluateFundamentalQuality([...annual,annual[2]],'IT',NOW)).not.toEqual([]);
+  expect(evaluateFundamentalQuality([...annual.slice(0,2),{...annual[2],date:'2026-06-30'}],'IT',NOW)).not.toEqual([]);
+  expect(evaluateFundamentalQuality(annual.map(row => ({...row,date:row.date.replace(/^202/,'201')})),'IT',NOW)).toContain('Annual financial statements are stale');
+});
 describe('NSE session and freshness',()=>{
-  it.each([['2026-11-18T10:35:00+05:30','LIVE'],['2026-11-18T09:10:00+05:30','PRE_OPEN'],['2026-11-18T15:29:59+05:30','UNKNOWN'],['2026-11-18T15:35:00+05:30','CLOSED'],['2026-11-15T10:35:00+05:30','CLOSED'],['2026-01-26T10:35:00+05:30','CLOSED'],['2026-11-08T18:00:00+05:30','UNKNOWN'],['2027-01-04T10:35:00+05:30','UNKNOWN']])('%s → %s',(date,state)=>expect(getMarketSession(new Date(date)).state).toBe(state));
+  it.each([['2026-11-18T10:35:00+05:30','LIVE'],['2026-11-18T09:10:00+05:30','PRE_OPEN'],['2026-11-18T15:29:59+05:30','UNKNOWN'],['2026-11-18T15:35:00+05:30','CLOSED'],['2026-11-15T10:35:00+05:30','CLOSED'],['2026-01-26T10:35:00+05:30','CLOSED'],['2026-11-08T18:00:00+05:30','CLOSED'],['2027-01-04T10:35:00+05:30','UNKNOWN']])('%s → %s',(date,state)=>expect(getMarketSession(new Date(date)).state).toBe(state));
   it('skips the holiday when computing the next opening',()=>expect(nextMarketOpen(new Date('2026-11-23T16:00:00+05:30')).toISOString()).toBe('2026-11-25T03:45:00.000Z'));
   it('earnings blackout counts exchange sessions, not weekends/holidays',()=>expect(tradingDaysAway(new Date('2026-11-20T12:00:00+05:30'),new Date('2026-11-25T12:00:00+05:30'))).toBe(2));
   it('a 15-minute delayed quote is identified without pretending to be real-time',()=>{const d=assessDataQuality('2026-11-18T10:20:00+05:30','2026-11-18T09:15:00+05:30',15,false,NOW);expect(d.stale).toBe(false);expect(d.delayMinutes).toBe(15);expect(d.incompleteCandle).toBe(true);});

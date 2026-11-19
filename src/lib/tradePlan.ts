@@ -82,6 +82,11 @@ export function getTradePlan(
   if (low > proposedHigh || stop >= low || proposedHigh >= t1 || t2 < t1) return null;
   const estimatedCostBps = stock.estimatedCostBps ?? 20;
   const estimatedSlippageBps = stock.estimatedSlippageBps ?? 5;
+  const quoteAt = stock.dataQuality?.quoteAt ?? undefined;
+  const referenceDay = dateToISTString(quoteAt ? new Date(quoteAt) : new Date());
+  const eligibility = stock.dataQuality?.sessionEligibility;
+  const cas = eligibility?.day === referenceDay ? eligibility.casEligible
+    : stock.tickSizeAsOf === referenceDay ? stock.casEligible ?? null : null;
   const policy = STRATEGY_POLICIES[stock.mode];
   const increment = tick ?? 0.01;
   const ceiling = rewardRiskEntryCeiling(
@@ -120,9 +125,9 @@ export function getTradePlan(
     chaseLimit: high,
     validUntil: entryExpiry(
       stock.mode,
-      stock.dataQuality?.quoteAt ?? undefined,
+      quoteAt,
       undefined,
-      stock.casEligible ?? null
+      cas
     ),
     tickSize: tick,
     netRiskReward: cost.netRR,

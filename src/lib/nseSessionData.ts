@@ -1,7 +1,7 @@
 import { parseCSV } from './csv';
 import type { OHLCV } from './indicators';
 import { readBoundedReport } from './nsePublicReports';
-import { cashSessionLimits, dateToISTString, latestCompletedSession } from './timezone';
+import { CASH_SPECIAL_SESSIONS, cashSessionLimits, dateToISTString, latestCompletedSession, sessionTime } from './timezone';
 
 const ARCHIVE = 'https://archives.nseindia.com';
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -62,7 +62,7 @@ export function parseCashSession(csv: string, day: string): Map<string, Exchange
     const key = symbol + '.NS',
       previousClose = Number(previous);
     const candle = {
-      date: new Date(day + 'T09:15:00+05:30'),
+      date: sessionTime(day, cashSessionLimits(day).continuousStart),
       open: Number(open),
       high: Number(high),
       low: Number(low),
@@ -97,7 +97,7 @@ export function parseIndexSession(csv: string, day: string): Map<string, Exchang
     const key = name === 'Nifty 50' ? '^NSEI' : name === 'India VIX' ? '^INDIAVIX' : name?.startsWith('Nifty ') ? name : null;
     if (!key || date !== reportDate(day).index || !open || !high || !low || !close) continue;
     const candle = {
-      date: new Date(day + 'T09:15:00+05:30'),
+      date: sessionTime(day, cashSessionLimits(day).continuousStart),
       open: Number(open),
       high: Number(high),
       low: Number(low),
@@ -147,10 +147,6 @@ function readSession(kind: 'cash' | 'index', day: string | null) {
 export const getCashSession = (day: string | null) => readSession('cash', day);
 export const getIndexSession = (day: string | null) => readSession('index', day);
 
-// Published cash sessions on weekends that are missing from some daily feeds.
-// These dates apply to historical OHLC only. Regular-session entry rules are separate.
-const CASH_SPECIAL_SESSIONS = ['2026-02-01', '2026-11-08'] as const;
-
 export async function restoreCashSpecialSessions(symbol: string, history: OHLCV[]) {
   if (history.length < 2 || !symbol.endsWith('.NS')) return history;
   const days = new Set(history.map(bar => dateToISTString(new Date(bar.date))));
@@ -166,8 +162,8 @@ export async function restoreCashSpecialSessions(symbol: string, history: OHLCV[
   }, history);
 }
 
-export function completedCloseTime(day: string) {
-  return new Date(+new Date(day + 'T00:00:00+05:30') + cashSessionLimits(day).finalClose * 60000);
+export function completedCloseTime(day: string, casEligible: boolean | null = null) {
+  return sessionTime(day, cashSessionLimits(day, casEligible).finalClose);
 }
 
 // The prior-close check avoids joining an unadjusted exchange bar onto a
@@ -177,7 +173,9 @@ export function mergeExchangeClose(
   official: ExchangeClose,
   day: string
 ): OHLCV[] | null {
-  const previousDay = latestCompletedSession(new Date(day + 'T09:00:00+05:30'));
+  if (official.candle.splitReported || history.some(bar =>
+      bar.splitReported && dateToISTString(new Date(bar.date)) === day)) return null;
+  const previousDay = latestCompletedSession(sessionTime(day, cashSessionLimits(day).preOpenStart));
   const earlier = history.filter((bar) => dateToISTString(new Date(bar.date)) < day);
   const prior = earlier.at(-1);
   if (!previousDay || !prior || dateToISTString(new Date(prior.date)) !== previousDay) return null;

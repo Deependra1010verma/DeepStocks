@@ -1,9 +1,10 @@
 import type { OHLCV } from './indicators';
 import type { ScreenerMode } from './screenerEngine';
-import { dateToISTString, nextMarketOpen, cashSessionLimits } from './timezone';
+import { calendarDay, dateToISTString, nextMarketOpen, cashSessionLimits, shiftDate, isContinuous15mBar, sessionTime } from './timezone';
 import { entryExpiry } from './strategyPolicy';
 export type PaperStatus = 'PENDING'|'OPEN'|'TARGET1'|'TARGET2'|'STOP_LOSS'|'EXPIRED'|'AMBIGUOUS'|'UNRESOLVED';
-export const PAPER_EVALUATION_VERSION = 3;
+export const PAPER_EVALUATION_VERSION = 6;
+const BAR_MS = 15 * 60_000;
 export interface PaperSignal {
   status: PaperStatus; entryLow: number; entryHigh: number; entry: number;
   stopLoss: number; target1: number; target2: number; createdAt: Date|string;
@@ -17,38 +18,105 @@ export function signalExpiry(mode: ScreenerMode, now: Date, casEligible: boolean
   if (mode==='intraday') return {entryExpiresAt,expiresAt:entryExpiresAt};
   if(mode==='btst'){
     const exitDate=dateToISTString(nextMarketOpen(entryExpiresAt));
-    const end=cashSessionLimits(exitDate,casEligible).continuousEnd;
-    return {entryExpiresAt,expiresAt:new Date(+new Date(`${exitDate}T00:00:00+05:30`)+end*60_000)};
+    if (!calendarDay(exitDate).trading) return {entryExpiresAt, expiresAt:entryExpiresAt};
+    return {entryExpiresAt,expiresAt:sessionTime(exitDate, cashSessionLimits(exitDate).continuousEnd)};
   }
   const holding = {swing_breakout:28,swing_pullback:28,positional:90,longterm:365}[mode];
   return {entryExpiresAt,expiresAt:new Date(+now+holding*86400000)};
 }
-export function evaluatePaperSignal(signal: PaperSignal, candles: OHLCV[], now = new Date()): PaperSignal {
+
+function hasUnverifiedGap(from: number, until: number, eligibility?: ReadonlyMap<string, boolean>): boolean {
+  if (from >= until) return from > until;
+
+  const lastDay = dateToISTString(new Date(until));
+  for (let day = dateToISTString(new Date(from)); day <= lastDay; day = shiftDate(day, 1)) {
+    const session = calendarDay(day);
+    if (!session.verified) return true;
+    if (!session.trading) continue;
+    const limits = cashSessionLimits(day, eligibility?.get(day) ?? false);
+    const open = +sessionTime(day, limits.continuousStart);
+    // Until historical CAS eligibility is available, require coverage through
+    // the latest possible continuous close before crossing a session boundary.
+    const close = +sessionTime(day, limits.continuousEnd);
+    const first = open + Math.max(0, Math.ceil((from - open) / BAR_MS)) * BAR_MS;
+    if (Math.max(first, open) < Math.min(until, close)) return true;
+  }
+  return false;
+}
+
+export function evaluatePaperSignal(
+  signal: PaperSignal, candles: OHLCV[], now = new Date(), eligibility?: ReadonlyMap<string, boolean>,
+  priceBasisActionDays: readonly string[] | null = []
+): PaperSignal {
   const next = {...signal};
   if (!['PENDING','OPEN','TARGET1'].includes(next.status)) return next;
   const start = new Date(next.checkedThrough ?? next.createdAt).getTime();
-  const bars = candles.filter(c=>+new Date(c.date)>=start && +new Date(c.date)+900000<=+now).sort((a,b)=>+new Date(a.date)-+new Date(b.date));
-  if (!bars.length) return +now > +new Date(next.expiresAt)+4*86400000 ? {...next,status:'UNRESOLVED',outcomeReason:'No usable price-path history after expiry; excluded from accuracy'} : next;
-  // We cannot infer fills or outcomes through missing history.
-  if (+new Date(bars[0].date)-start > 4*86400000) return {...next,status:'UNRESOLVED',outcomeReason:'Missing price-path history; excluded from accuracy'};
+  const expires = +new Date(next.expiresAt);
+  const entryExpires = Math.min(+new Date(next.entryExpiresAt), expires);
+  const created = +new Date(next.createdAt);
+  if (![start, expires, entryExpires, created].every(Number.isFinite)) {
+    return { ...next, status: 'UNRESOLVED', closedAt: now, exitPrice: undefined, realizedR: undefined,
+      outcomeReason: 'Missing or invalid price-path timestamps' };
+  }
+  const bars = candles.filter(c=>+new Date(c.date)>=start && +new Date(c.date)+BAR_MS<=+now).sort((a,b)=>+new Date(a.date)-+new Date(b.date));
+  let cursor = start;
   const slippage = Math.max(0,next.slippageBps??5)/10000;
-  const close = (status: PaperStatus, price: number, at: Date|string, reason: string) => {
+  const close = (status: PaperStatus, price: number | undefined, at: Date|string, reason: string) => {
     next.status=status;next.exitPrice=price;next.closedAt=at;next.outcomeReason=reason;
-    if (status==='AMBIGUOUS'||status==='UNRESOLVED'||!next.filledAt) return;
+    next.realizedR = undefined;
+    if (status==='AMBIGUOUS'||status==='UNRESOLVED'||!next.filledAt||price===undefined) return;
     const risk=next.entry-next.stopLoss;
     const firstExit = next.target1Price ?? next.target1 * (1 - slippage);
     const gross=next.target1At ? 0.5*(firstExit-next.entry)+0.5*(price-next.entry) : price-next.entry;
     next.realizedR=risk>0?(gross-next.entry*Math.max(0,next.costBps??20)/10000)/risk:undefined;
   };
+  // A provider can restate earlier candles after an action. Check the full
+  // fetched window before interpreting any price against frozen levels.
+  const from = dateToISTString(new Date(created)), through = dateToISTString(now);
+  const affected = (day: string) => day >= from && day <= through;
+  if (candles.some(bar => bar.splitReported && +new Date(bar.date) <= +now &&
+        affected(dateToISTString(new Date(bar.date)))) || priceBasisActionDays?.some(affected)) {
+    close('UNRESOLVED', undefined, now, 'Corporate action reported; frozen levels and candle adjustment basis require verification');
+    return next;
+  }
+  if (priceBasisActionDays === null) {
+    const deadline = next.status === 'PENDING' ? entryExpires : expires;
+    if (+now > deadline + 4 * 86400000) close('UNRESOLVED', undefined, now, 'Historical NSE corporate-action coverage unavailable');
+    else next.outcomeReason = 'Waiting for historical NSE corporate-action coverage';
+    return next;
+  }
+  if (next.outcomeReason === 'Waiting for historical NSE corporate-action coverage') next.outcomeReason = undefined;
   for (const bar of bars) {
-    const at=new Date(bar.date), end=new Date(+at+900000);
-    if (![bar.open,bar.high,bar.low,bar.close].every(Number.isFinite)||bar.high<bar.low) {close('UNRESOLVED',0,at,'Invalid OHLC data');break;}
+    const at=new Date(bar.date), end=new Date(+at+BAR_MS);
+    const pending = next.status === 'PENDING';
+    const deadline = pending ? entryExpires : expires;
+    if (pending && +at >= deadline && !hasUnverifiedGap(cursor, deadline, eligibility)) {
+      close('EXPIRED', undefined, new Date(deadline), 'Entry window expired without fill');
+      break;
+    }
+    if (+end > deadline) {
+      close('UNRESOLVED', undefined, new Date(deadline), 'No complete price path through expiry');
+      break;
+    }
+    if (!isContinuous15mBar(at, eligibility?.get(dateToISTString(at)) ?? null) || hasUnverifiedGap(cursor, +at, eligibility)) {
+      close('UNRESOLVED', undefined, at, 'Missing or misaligned price-path history');
+      break;
+    }
+    if (![bar.open,bar.high,bar.low,bar.close].every(Number.isFinite) ||
+        bar.low <= 0 || bar.high < Math.max(bar.open, bar.close) || bar.low > Math.min(bar.open, bar.close)) {
+      close('UNRESOLVED', undefined, at, 'Invalid OHLC data');
+      break;
+    }
+    cursor = +end;
     next.checkedThrough=end;
     let justFilled=false;
     if (next.status==='PENDING') {
-      if (+at>=+new Date(next.entryExpiresAt)) {close('EXPIRED',bar.open,at,'Entry window expired without fill');break;}
       if (bar.open<next.stopLoss) {close('EXPIRED',bar.open,at,'Gap below invalidation before entry');break;}
-      if (bar.low>next.entryHigh||bar.high<next.entryLow) continue;
+      if (bar.low>next.entryHigh||bar.high<next.entryLow) {
+        if (+end === entryExpires) close('EXPIRED', undefined, end, 'Entry window expired without fill');
+        if (next.closedAt) break;
+        continue;
+      }
       const raw=bar.open>=next.entryLow&&bar.open<=next.entryHigh?bar.open:bar.open<next.entryLow?next.entryLow:next.entryHigh;
       next.entry=raw*(1+slippage);next.filledAt=at;next.status='OPEN';justFilled=raw!==bar.open;
     }
@@ -62,8 +130,11 @@ export function evaluatePaperSignal(signal: PaperSignal, candles: OHLCV[], now =
       if (hitStop) {close('STOP_LOSS',Math.min(bar.open,next.stopLoss)*(1-slippage),at,'Stop crossed, including opening gap and assumed slippage');break;}
       if (hitT1&&!next.target1At) {next.target1At=at;next.target1Price=next.target1*(1-slippage);next.status='TARGET1';}
       if (hitT2) {close('TARGET2',next.target2*(1-slippage),at,'Second target reached; half position modeled at first target');break;}
-      if (+end>=+new Date(next.expiresAt)) {close('EXPIRED',bar.close*(1-slippage),at,'Holding horizon expired; modeled exit at close');break;}
+      if (+end === expires) {close('EXPIRED',bar.close*(1-slippage),end,'Holding horizon expired; modeled exit at close');break;}
     }
+  }
+  if (!next.closedAt && +now > (next.status === 'PENDING' ? entryExpires : expires) + 4 * 86400000) {
+    close('UNRESOLVED', undefined, now, 'No usable price-path history through expiry');
   }
   return next;
 }

@@ -1,5 +1,5 @@
 import { test,expect,type Page } from '@playwright/test';
-import { stock,NOW } from '../fixtures';
+import { bar,stock,NOW } from '../fixtures';
 import type { ScreenerMode } from '../../src/lib/screenerEngine';
 import { guardFingerprint } from '../../src/lib/aiCachePolicy';
 import { emptyPortfolio, applyPortfolioAction, portfolioTotals, positionReview, type PortfolioAction } from '../../src/lib/portfolioEngine';
@@ -24,8 +24,9 @@ async function setup(page:Page,controls:Controls={}) {
     if(url.pathname==='/api/market-mood')payload={regime:'NEUTRAL',available:true,niftyClose:'25000',ema20:'24900',ema50:'24800',session:{state:'LIVE',label:'MARKET OPEN',message:'Fixture session',timeIST:'10:35 IST'}};
     if(url.pathname==='/api/sector-strength')payload={topSectors:[]};
     if(url.pathname==='/api/portfolio'){
-      if(req.method()==='POST')portfolio=applyPortfolioAction(portfolio,body.action as PortfolioAction,NOW);
-      payload={portfolio,totals:portfolioTotals(portfolio,NOW),reviews:portfolio.positions.map(p=>({id:p.id,actions:positionReview(p,NOW)}))};
+      const journalNow = new Date(await page.evaluate(() => Date.now()));
+      if(req.method()==='POST')portfolio=applyPortfolioAction(portfolio,body.action as PortfolioAction,journalNow);
+      payload={portfolio,totals:portfolioTotals(portfolio,journalNow),reviews:portfolio.positions.map(p=>({id:p.id,actions:positionReview(p,journalNow)}))};
     }
     if(url.pathname==='/api/ledger')payload={stats:{closed:0,wins:0,winRate:null}};
     if(url.pathname==='/api/stock'){
@@ -60,6 +61,62 @@ test('a compact snapshot loads chart candles even when the AI provider fails',as
   expect(errors).toEqual([]);
 });
 test('open dashboard polls snapshots and shows partial coverage',async({page})=>{const {calls}=await setup(page);await expect(page.getByText(/Coverage 259\/261/)).toBeVisible();const count=calls.filter(c=>c.path==='/api/scan').length;await page.clock.fastForward(61000);await expect.poll(()=>calls.filter(c=>c.path==='/api/scan').length).toBeGreaterThan(count);});
+
+test('dashboard uses daily and intraday chart labels across a weekend gap', async ({ page }) => {
+  await setup(page, { failAnalysis: true });
+  await choose(page, 'ALPHA');
+  await expect(page.getByText('1D · IST', { exact: true })).toBeVisible();
+
+  await page.route('**/api/scan?**', async route => {
+    if (new URL(route.request().url()).searchParams.get('mode') !== 'intraday') return route.fallback();
+    const candles = [bar('2026-11-13T15:00:00+05:30'), bar('2026-11-16T09:15:00+05:30')];
+    return route.fulfill({ json: {
+      stocks: [stock({ mode: 'intraday', candles, nearMiss: true })],
+      generatedAt: NOW.toISOString(), expiresAt: new Date(+NOW + 3600000).toISOString(), stale: false,
+    } });
+  });
+  await page.getByRole('button', { name: 'Intraday', exact: true }).click();
+  await choose(page, 'ALPHA');
+  const badge = page.getByText('15m · IST', { exact: true });
+  await expect(badge).toBeVisible();
+  await expect(badge.locator('..')).toContainText(/16 Nov 2026.*09:15/);
+  await expect(page.locator('canvas').first()).toBeVisible();
+});
+
+test('the chart paints the canonical entry, stop and both target labels', async ({ page }) => {
+  await page.addInitScript(() => {
+    const labels = new Set<string>();
+    Object.defineProperty(window, 'priceLabels', { value: labels });
+    const original = CanvasRenderingContext2D.prototype.fillText;
+    CanvasRenderingContext2D.prototype.fillText = function (text, x, y, maxWidth) {
+      labels.add(text);
+      return maxWidth === undefined ? original.call(this, text, x, y) : original.call(this, text, x, y, maxWidth);
+    };
+  });
+  await setup(page);
+  await choose(page, 'ALPHA');
+  await expect(page.locator('canvas').first()).toBeVisible();
+  await expect.poll(() => page.evaluate(() => [...(window as unknown as {priceLabels: Set<string>}).priceLabels]))
+    .toEqual(expect.arrayContaining(['Entry', 'SL', 'T1', 'T2', '995.01', '970.00', '1040.00', '1080.00']));
+});
+
+test('snapshot outage retains cards and clears the alert when the same revision returns', async ({ page }) => {
+  const { calls } = await setup(page);
+  const card = page.getByText('ALPHA test fixture', { exact: true });
+  const notice = page.getByRole('alert').filter({ hasText: 'Could not load the scan snapshot' });
+  await expect(card).toBeVisible();
+  await page.route('**/api/scan?**', route => route.fulfill({
+    status: 503, headers: { 'Retry-After': '15' }, json: { code: 'SNAPSHOT_UNAVAILABLE' },
+  }), { times: 1 });
+  await page.clock.fastForward(15000);
+  await expect(notice).toBeVisible();
+  await expect(card).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Scan Swing BO', exact: true })).toBeEnabled();
+  await page.clock.fastForward(15000);
+  await expect(notice).toHaveCount(0);
+  await expect(card).toBeVisible();
+  expect(calls.some(call => call.path === '/api/scan' && call.method === 'POST')).toBe(false);
+});
 
 test('a stalled refresh preserves results and polling, and cannot lock a different tab', async ({ page }) => {
   const { calls, errors } = await setup(page);
@@ -140,6 +197,7 @@ test('records manual fills and reviews exits in the private portfolio', async ({
   await page.getByRole('spinbutton',{name:'Portfolio cash'}).fill('100000');
   await page.getByRole('button',{name:'Save cash & limits'}).click();
   await expect(page.getByText('₹100000.00').first()).toBeVisible();
+  await expect(page.getByRole('spinbutton',{name:'Daily equity loss halt %'})).toHaveValue('2');
   await page.getByRole('textbox',{name:'Fill symbol'}).fill('ALPHA');
   await page.getByRole('spinbutton',{name:'Fill quantity'}).fill('10');
   await page.getByRole('spinbutton',{name:'Fill price'}).fill('100');
@@ -150,6 +208,7 @@ test('records manual fills and reviews exits in the private portfolio', async ({
   await page.getByRole('spinbutton',{name:'Observed price ALPHA.NS'}).fill('112');
   await page.getByRole('button',{name:'Update observed price'}).click();
   await expect(page.getByText(/Observed price reached T1/)).toBeVisible();
+  await expect(page.getByText(/Daily equity P&L ₹120\.00/)).toBeVisible();
 });
 
 test('Groww holdings remain clickable over the dashboard when the journal is unavailable', async ({page}) => {
@@ -183,7 +242,7 @@ test('a partial scan poll preserves the selected chart and in-flight explanation
   let finish!: () => void;
   const delayed = new Promise<void>(resolve => { finish=resolve; });
   let analyzeStarted = false;
-  const analyzed = stock({cmp:1018});
+  const analyzed = stock({cmp:1018,dataQuality:{...stock().dataQuality!,fetchedAt:new Date(+NOW+5000).toISOString()}});
   await page.route('**/api/analyze', async route => {
     analyzeStarted = true;
     await delayed;
@@ -210,4 +269,47 @@ test('a partial scan poll preserves the selected chart and in-flight explanation
   await page.clock.fastForward(16000);
   await expect(page.getByText('AI explanation with quant guardrails',{exact:true})).toBeVisible();
   await expect(page.getByText('Setup updated.',{exact:false})).toHaveCount(0);
+});
+
+test('a late AI result cannot restore a setup blocked by newer stock evidence', async ({page}) => {
+  await setup(page);
+  const initial = stock({nearMiss:false,breakoutDaysAgo:1});
+  const changed = {
+    ...initial, cmp:1018, nearMiss:true, earningsRisk:true,
+    guardReasons:['New earnings blackout'],
+    dataQuality:{...initial.dataQuality!,fetchedAt:new Date(+NOW+15000).toISOString()},
+    candles:[]
+  };
+  const snapshot = (stocks: unknown[], at: number) => ({
+    stocks, generatedAt: new Date(at).toISOString(), expiresAt:new Date(+NOW+3600000).toISOString(),
+    cached: true, stale: false
+  });
+  await page.route('**/api/scan?**', route => route.fulfill({json:snapshot([initial],+NOW)}));
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/analyze', async route => {
+    await delayed;
+    await route.fulfill({json:{
+      stock:initial, analysis:{executiveSummary:'Obsolete explanation'},
+      cachedAt:NOW.toISOString(), expiresAt:new Date(+NOW+3600000).toISOString(),
+      cachedCmp:initial.cmp, fingerprint:guardFingerprint(initial), cached:false
+    }});
+  });
+  const started = page.waitForRequest(request => request.url().endsWith('/api/analyze'));
+  try {
+    await choose(page,'ALPHA');
+    await started;
+    await page.route('**/api/scan?**', route => route.fulfill({json:snapshot([changed],+NOW+15000)}));
+    await page.clock.fastForward(16000);
+    await expect(page.getByText('₹1018.00',{exact:true}).first()).toBeVisible();
+    const response = page.waitForResponse(result => result.url().endsWith('/api/analyze'));
+    release();
+    await response;
+    await expect(page.getByText('Setup updated. Refresh the explanation using current data.')).toBeVisible();
+    await expect(page.getByText('AI explanation with quant guardrails',{exact:true})).toHaveCount(0);
+    await expect(page.getByRole('button',{name:'Track paper'})).toBeDisabled();
+    await expect(page.locator('canvas').first()).toBeVisible();
+  } finally {
+    release();
+  }
 });

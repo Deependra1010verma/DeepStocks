@@ -2,6 +2,7 @@ import type { ScreenedStock } from './screenerEngine';
 import type { NewsItem } from './dataFetcher';
 import { getTradePlan } from './tradePlan';
 import { RVOL_SESSIONS } from './relativeVolume';
+import { comparableAnnualPeriods, positiveNumber } from './fundamentalQuality';
 export const EVIDENCE_VERSION = 'evidence-2026-11-v1';
 export interface ResearchFact {
   id: string;
@@ -97,22 +98,21 @@ export function buildResearchEvidence(stock: ScreenedStock, news: NewsItem[] = [
         : `${label}: ${unit === 'fraction' ? `${(value * 100).toFixed(2)}%` : unit === 'percent-ratio' ? `${value.toFixed(2)}% (ratio ${(value / 100).toFixed(2)}×)` : unit === 'INR' ? `₹${value.toFixed(0)}` : `${value.toFixed(2)}×`}. Provider reporting period is unspecified; no peer/sector ranking or multi-year growth is inferred.`;
     add(id, 'fundamental', text, value == null ? 'unknown' : 'reported', f.asOf ?? null);
   }
-  const years = [...(f.annualHistory ?? [])]
-    .filter((y) => Number.isFinite(Date.parse(y.date)) && Date.parse(y.date) <= Date.now())
-    .sort((a, b) => a.date.localeCompare(b.date));
-  if (years.length) {
+  const {years, issue} = comparableAnnualPeriods(f.annualHistory);
+  if (years) {
     const y = years.at(-1)!;
     const conversion =
-      y.profit && y.profit > 0 && y.operatingCashFlow != null ? y.operatingCashFlow / y.profit : null;
+      positiveNumber(y.profit) && y.operatingCashFlow !== null && Number.isFinite(y.operatingCashFlow)
+        ? y.operatingCashFlow / y.profit : null;
     add(
       'cash-conversion',
       'fundamental',
-      `Annual period ended ${y.date}: operating cash flow / profit ${conversion == null ? 'unavailable' : conversion.toFixed(2) + '×'}. Filing publication date is unavailable; do not use this as point-in-time backtest evidence.`,
-      'reported',
+      `Fiscal period end ${y.date}: operating cash flow / profit ${conversion == null ? 'unavailable' : conversion.toFixed(2) + '×'}. Provider retrieval: ${f.asOf ?? 'unknown'}. Filing publication and historical availability are unverified.`,
+      conversion == null ? 'unknown' : 'calculated',
       f.asOf ?? null
     );
     const first = years[0];
-    if (first !== y && first.shares != null && first.shares > 0 && y.shares != null)
+    if (positiveNumber(first.shares) && positiveNumber(y.shares))
       add(
         'dilution',
         'fundamental',
@@ -120,6 +120,8 @@ export function buildResearchEvidence(stock: ScreenedStock, news: NewsItem[] = [
         'calculated',
         f.asOf ?? null
       );
+  } else if (stock.mode === 'longterm') {
+    add('annual-coverage','fundamental', issue, 'unknown');
   }
   add(
     'filings',
@@ -144,7 +146,7 @@ export function buildResearchEvidence(stock: ScreenedStock, news: NewsItem[] = [
   if (stock.exchangePriceBand) {
     const band=stock.exchangePriceBand;
     add('nse-price-band','risk',
-      band.percent==null?'NSE lists no fixed daily price band. Dynamic controls may apply.':`NSE published a fixed daily price band of ${band.percent}%.`,
+      band.percent==null?'Published NSE reference shows no fixed daily band. Effective price limits remain unverified.':`Published NSE band reference: ${band.percent}%. Effective price limits remain unverified.`,
       'reported',band.publishedDay,'https://nsearchives.nseindia.com/content/equities/sec_list.csv');
   }
   const p = getTradePlan(stock);

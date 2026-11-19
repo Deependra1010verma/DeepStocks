@@ -1,6 +1,7 @@
 "use client";
 import { ScreenedStock } from "@/lib/screenerEngine";
 import type { RemovedScanStock } from "@/lib/models/ScanSnapshot";
+import { qualifiesForShortlist } from "@/lib/strategyPolicy";
 
 interface Props {
   stocks: ScreenedStock[];
@@ -96,8 +97,8 @@ export default function StockList({ stocks, removedToday, selected, onSelect, lo
     );
   }
 
-  const qualified = stocks.filter(s => !s.nearMiss || s.researchQualified);
-  const nearMiss = stocks.filter(s => s.nearMiss && !s.researchQualified);
+  const qualified = stocks.filter(qualifiesForShortlist);
+  const nearMiss = stocks.filter(s => !qualifiesForShortlist(s));
 
   return (
     <div className="flex flex-col">

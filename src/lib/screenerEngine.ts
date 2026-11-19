@@ -1,8 +1,9 @@
+import type { ReferenceCoverage } from './entryClearance';
 import {
   calcEMA, calcRSI, calcMACD, calcATR, calcVWAP, highestHigh, OHLCV,
 } from "./indicators";
 import { StockData, FundamentalData } from "./dataFetcher";
-import { dateToISTString, latestCompletedSession } from "./timezone";
+import { dateToISTString, latestCompletedSession, todayIST } from "./timezone";
 import { computeRVOL, type RelativeVolume } from './relativeVolume';
 import type { DataQuality } from './dataQuality';
 import { confirmBtstMomentum, confirmDailyReversal, confirmIntradayBreakout } from './entrySignals';
@@ -14,6 +15,7 @@ import type { NsePriceBand } from './nsePriceBands';
 export type ScreenerMode = "intraday" | "btst" | "swing_breakout" | "swing_pullback" | "positional" | "longterm";
 
 export interface ScreenedStock {
+  referenceCoverage?: ReferenceCoverage;
   tickSize?: number;
   tickSizeAsOf?: string;
   casEligible?: boolean;
@@ -110,12 +112,12 @@ function getWeeklyTrend(candles?: OHLCV[]): "BULLISH" | "NEUTRAL" | "BEARISH" | 
   return "NEUTRAL";
 }
 
-function completedDailyBars(candles: OHLCV[], now = new Date()): OHLCV[] {
-  const completed = latestCompletedSession(now);
+function completedDailyBars(candles: OHLCV[], now: Date, casEligible: boolean | null): OHLCV[] {
+  const completed = latestCompletedSession(now, casEligible);
   return completed ? candles.filter(c => dateToISTString(new Date(c.date)) <= completed) : [];
 }
-export function findBreakoutDaysAgo(candles: OHLCV[], now = new Date()): number | null {
-  candles = completedDailyBars(candles, now);
+export function findBreakoutDaysAgo(candles: OHLCV[], now = new Date(), casEligible: boolean | null = null): number | null {
+  candles = completedDailyBars(candles, now, casEligible);
   for (let daysAgo = 0; daysAgo <= 2; daysAgo++) {
     const index = candles.length - 1 - daysAgo;
     if (index < 20) continue;
@@ -127,10 +129,10 @@ export function findBreakoutDaysAgo(candles: OHLCV[], now = new Date()): number 
   }
   return null;
 }
-export function breakoutRetest(candles: OHLCV[], atr: number, now = new Date()): { level:number; bar:OHLCV } | null {
-  const days = findBreakoutDaysAgo(candles, now);
+export function breakoutRetest(candles: OHLCV[], atr: number, now = new Date(), casEligible: boolean | null = null): { level:number; bar:OHLCV } | null {
+  const days = findBreakoutDaysAgo(candles, now, casEligible);
   if (days == null || days===0 || atr<=0) return null;
-  const complete=completedDailyBars(candles,now), index=complete.length-1-days;
+  const complete=completedDailyBars(candles,now,casEligible), index=complete.length-1-days;
   const level=Math.max(...complete.slice(index-20,index).map(c=>c.high));
   const subsequent=complete.slice(index+1);
   if(subsequent.some(c=>c.close<level))return null;
@@ -142,9 +144,14 @@ function buildSectorBoosts(stocks: Map<string, StockData>): Map<string, number> 
   return new Map([...stocks.values()].map(data => [data.sector ?? 'Unknown', data.sectorBenchmark?.scoreBoost ?? 0]));
 }
 
+function currentCas(data: StockData) {
+  const eligibility = data.dataQuality?.sessionEligibility;
+  return eligibility?.day === todayIST() ? eligibility.casEligible : null;
+}
+
 function stockRelativeVolume(data: StockData, intraday = false) {
   const quoteVolume = data.quoteVolume === undefined ? data.volume : data.quoteVolume;
-  return computeRVOL(data.candles, quoteVolume, intraday, data.dataQuality?.quoteAt);
+  return computeRVOL(data.candles, quoteVolume, intraday, data.dataQuality?.quoteAt, undefined, currentCas(data));
 }
 
 export function sessionVWAP(candles: OHLCV[]): number {
@@ -242,7 +249,7 @@ export function screenIntraday(stocks: Map<string, StockData>): ScreenedStock[] 
     const extension = getExtension(currentPrice, ema20, vwap, atr, true);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
     const breakoutDaysAgo = null;
-    const signal=confirmIntradayBreakout(candles,data.dataQuality?.quoteAt);
+    const signal=confirmIntradayBreakout(candles,data.dataQuality?.quoteAt, undefined, currentCas(data));
 
     const lastCandle = candles.at(-1)!;
     const closingStrength = lastCandle.high !== lastCandle.low
@@ -273,7 +280,7 @@ export function screenIntraday(stocks: Map<string, StockData>): ScreenedStock[] 
       [!signal || currentPrice >= signal.level, 'Price fell below the intraday breakout level'],
       [currentPrice > vwap, 'Price is at or below session VWAP'],
       [!extension.extensionWarning, 'Extended move — wait for a pullback'],
-      [rvol >= 1.5, 'Intraday RVOL below 1.5× or baseline unavailable'],
+      [rvol >= 1.5, (!relativeVolume && data.intradayVolumeNote) || 'Intraday RVOL below 1.5× or baseline unavailable'],
       [rsi >= 55 && rsi <= 80, 'Intraday RSI outside 55–80'],
       [dayChangePercent >= 0.5 && dayChangePercent <= 6, 'Session gain outside 0.5–6%'],
       [atrPct >= 0.3, 'Intraday ATR below 0.3% of price']
@@ -318,9 +325,9 @@ export function screenBTST(stocks: Map<string, StockData>): ScreenedStock[] {
     const vwap = calcVWAP(candles.slice(-20));
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
-    const breakoutDaysAgo = findBreakoutDaysAgo(candles);
-    const signal=confirmBtstMomentum(data.confirmationCandles??[],data.dataQuality?.quoteAt);
-    const completedSession=latestCompletedSession();
+    const breakoutDaysAgo = findBreakoutDaysAgo(candles, undefined, currentCas(data));
+    const signal=confirmBtstMomentum(data.confirmationCandles??[],data.dataQuality?.quoteAt, undefined, currentCas(data));
+    const completedSession=latestCompletedSession(undefined, currentCas(data));
     const prevSessionCandle=completedSession
       ? candles.findLast(candle=>dateToISTString(new Date(candle.date))===completedSession)
       : undefined;
@@ -400,9 +407,9 @@ export function screenSwingBreakout(stocks: Map<string, StockData>): ScreenedSto
     const vwap = calcVWAP(candles.slice(-20));
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
-    const breakoutDaysAgo = findBreakoutDaysAgo(candles);
+    const breakoutDaysAgo = findBreakoutDaysAgo(candles, undefined, currentCas(data));
     const hh20 = highestHigh(highs, 20);
-    const retest = breakoutRetest(candles, atr);
+    const retest = breakoutRetest(candles, atr, undefined, currentCas(data));
 
     const lastCandle = candles.at(-1)!;
     const closingStrength = lastCandle.high !== lastCandle.low
@@ -481,11 +488,11 @@ export function screenSwingPullback(stocks: Map<string, StockData>): ScreenedSto
     const vwap = calcVWAP(candles.slice(-20));
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
-    const breakoutDaysAgo = findBreakoutDaysAgo(candles);
+    const breakoutDaysAgo = findBreakoutDaysAgo(candles, undefined, currentCas(data));
 
     const lastCandle = candles.at(-1)!;
     const distFromEma20 = ema20 > 0 ? Math.abs(currentPrice - ema20) / ema20 : 1;
-    const reversal=confirmDailyReversal(candles,20,atr);
+    const reversal=confirmDailyReversal(candles,20,atr,undefined,currentCas(data));
     const closingStrength = lastCandle.high !== lastCandle.low
       ? (lastCandle.close - lastCandle.low) / (lastCandle.high - lastCandle.low)
       : 0.5;
@@ -559,8 +566,8 @@ export function screenPositional(stocks: Map<string, StockData>): ScreenedStock[
     const vwap = calcVWAP(candles.slice(-20));
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
-    const breakoutDaysAgo = findBreakoutDaysAgo(candles);
-    const reversal=confirmDailyReversal(candles,50,atr);
+    const breakoutDaysAgo = findBreakoutDaysAgo(candles, undefined, currentCas(data));
+    const reversal=confirmDailyReversal(candles,50,atr,undefined,currentCas(data));
 
     const fg = fundamentals;
     const fundamentalsAvailable = [
@@ -655,7 +662,7 @@ export function screenLongTerm(stocks: Map<string, StockData>): ScreenedStock[] 
     const vwap = calcVWAP(candles.slice(-20));
     const extension = getExtension(currentPrice, ema20, vwap, atr);
     const weeklyTrend = getWeeklyTrend(data.weeklyCandles);
-    const breakoutDaysAgo = findBreakoutDaysAgo(candles);
+    const breakoutDaysAgo = findBreakoutDaysAgo(candles, undefined, currentCas(data));
 
     const fg = fundamentals;
     // Quality score for companies with reported fundamentals.

@@ -2,19 +2,20 @@ import type { ScreenedStock } from './screenerEngine';
 import type { AIAnalysisResult } from './aiAnalyst';
 import { getTradePlan } from './tradePlan';
 import { buildResearchEvidence } from './researchEvidence';
-import { entryEvidence } from './strategyPolicy';
+import { entryEvidence, requiresOvernightClearance } from './strategyPolicy';
+import { referenceEntryReasons } from './entryClearance';
 export function enforceRiskGuards(
   analysis: Partial<AIAnalysisResult>,
   stock: ScreenedStock
 ): AIAnalysisResult {
   const plan = getTradePlan(stock);
   const longTerm = stock.mode === 'longterm';
-  const flags = [...(stock.guardReasons ?? [])];
+  const flags = [...(stock.guardReasons ?? []), ...referenceEntryReasons(stock)];
   if (stock.nearMiss && !stock.researchQualified) flags.push('Entry conditions are not fully confirmed.');
   if (['intraday', 'btst', 'swing_breakout'].includes(stock.mode) && stock.rvol < 1.2)
     flags.push('Volume confirmation missing.');
   if (stock.earningsRisk) flags.push('Earnings/event soon — do not hold overnight.');
-  if (stock.eventStatus !== 'known' && ['btst', 'swing_breakout', 'swing_pullback'].includes(stock.mode))
+  if (stock.eventStatus !== 'known' && requiresOvernightClearance(stock.mode))
     flags.push('Earnings calendar unverified.');
   if (stock.liquidityPass !== true) flags.push('Liquidity not verified.');
   if (!stock.dataQuality || stock.dataQuality.stale) flags.push('Data freshness not verified.');

@@ -1,7 +1,7 @@
 import type { ScreenerMode } from './screenerEngine';
 import type { NumericTradePlan } from './tradePlan';
 import { tradeCosts } from './strategyPolicy';
-import { dateToISTString } from './timezone';
+import { calendarDay, dateToISTString, latestCompletedSession, sessionTime } from './timezone';
 export interface RiskPolicy {
   perTradePercent: number;
   totalRiskPercent: number;
@@ -44,6 +44,7 @@ export interface PortfolioEvent {
   quantity?: number;
   price?: number;
   realized?: number;
+  cashFlow?: number;
   note: string;
   signature: string;
 }
@@ -99,7 +100,106 @@ function finite(n: unknown, low: number, high = 1e12): n is number {
 function fail(message: string): never {
   throw new Error(message);
 }
-export function portfolioTotals(p: Portfolio, now = new Date()) {
+
+export interface PortfolioPriorCloses {
+  session: string;
+  prices: Record<string, number>;
+  issue?: string;
+}
+
+const MARK_MAX_AGE = 20 * 60_000;
+function hasCurrentMark(position: Position, now: Date) {
+  const at = Date.parse(position.markAt ?? '');
+  return finite(position.mark, 0.01) && at <= +now && +now - at <= MARK_MAX_AGE &&
+    dateToISTString(new Date(at)) === dateToISTString(now);
+}
+
+// Legacy settings wrote this exact note when recording before/after cash.
+// New events also store the signed change directly.
+function recordedCashFlow(event: PortfolioEvent): number {
+  if (event.cashFlow !== undefined) return event.cashFlow;
+  const recorded = /^Manual cash reconciliation: (\S+) → (\S+); risk policy updated$/.exec(event.note);
+  return recorded ? Number(recorded[2]) - Number(recorded[1]) : NaN;
+}
+
+export function portfolioSessionOpening(p: Portfolio, now = new Date()) {
+  const session = dateToISTString(now);
+  if (!calendarDay(session).trading) return { reason: 'No verified NSE cash session for daily equity sizing' };
+  const dayStart = +sessionTime(session, 0);
+  // The previous final close values carried shares. Counting journal activity
+  // from midnight IST includes any recorded opening-auction fills.
+  const priorSession = latestCompletedSession(new Date(dayStart));
+  const shares = new Map<string, number>();
+  for (const position of p.positions) {
+    shares.set(position.symbol, (shares.get(position.symbol) ?? 0) + position.quantity);
+  }
+  let openingCash = p.cash, netCashFlow = 0;
+  for (const event of p.events) {
+    if (event.type !== 'settings' && event.type !== 'fill') continue;
+    const at = Date.parse(event.at);
+    if (at < dayStart) continue;
+    if (!Number.isFinite(at) || at > +now) return { reason: 'Journal activity timestamp unverified for daily equity' };
+    if (event.type === 'settings') {
+      const flow = recordedCashFlow(event);
+      if (!Number.isFinite(flow)) return { reason: 'Cash adjustments are unverified for daily equity' };
+      openingCash -= flow;
+      netCashFlow += flow;
+      continue;
+    }
+    let fill: Partial<Extract<PortfolioAction, {type:'fill'}>>;
+    try { fill = JSON.parse(event.signature); }
+    catch { return { reason: 'Recorded fill details are unavailable for daily equity' }; }
+    if (fill?.type !== 'fill' || (fill.side !== 'BUY' && fill.side !== 'SELL') ||
+        fill.symbol !== event.symbol || fill.quantity !== event.quantity || fill.price !== event.price ||
+        Date.parse(fill.at ?? '') !== at || !fill.symbol || !finite(fill.quantity, 1) ||
+        !Number.isSafeInteger(fill.quantity) || !finite(fill.price, 0.01) || !finite(fill.fees, 0)) {
+      return { reason: 'Recorded fill details are unverified for daily equity' };
+    }
+    const direction = fill.side === 'BUY' ? 1 : -1;
+    shares.set(fill.symbol, (shares.get(fill.symbol) ?? 0) - direction * fill.quantity);
+    openingCash += direction * fill.quantity * fill.price + fill.fees;
+  }
+  if (!Number.isFinite(openingCash) || openingCash < -0.000001 ||
+      [...shares.values()].some(quantity => !Number.isSafeInteger(quantity) || quantity < 0)) {
+    return { reason: 'Opening cash or share quantities cannot be reconciled from the journal' };
+  }
+  const carried = [...shares].filter(([, quantity]) => quantity > 0);
+  // Initial account funding establishes opening capital on the first day.
+  // Later deposits and withdrawals stay out of both P&L and the loss budget.
+  const first = p.events.find(event => event.type === 'settings' || event.type === 'fill');
+  const initialFunding = first?.type === 'settings' && Date.parse(first.at) >= dayStart &&
+    Math.abs(openingCash) <= 0.000001 && !carried.length ? Math.max(0, recordedCashFlow(first)) : 0;
+  return { session, priorSession, carried, cash: Math.max(0, openingCash) + initialFunding, netCashFlow: netCashFlow - initialFunding };
+}
+
+function dailyEquity(p: Portfolio, equity: number, staleMarks: number, now: Date, priorCloses?: PortfolioPriorCloses | null) {
+  const opening = portfolioSessionOpening(p, now);
+  const missing = (reason: string) => ({
+    session: dateToISTString(now), openingEquity: null, netCashFlow: null, pnl: null, percent: null, reason
+  });
+  if (!opening.carried) return missing(opening.reason);
+  if (staleMarks) return missing('Current holding marks are unavailable for daily equity');
+  let openingEquity = opening.cash;
+  if (opening.carried.length && (!opening.priorSession || priorCloses?.session !== opening.priorSession)) {
+    return missing('Previous NSE session closes are unavailable for overnight holdings');
+  }
+  if (opening.carried.length && priorCloses?.issue) return missing(priorCloses.issue);
+  for (const [symbol, quantity] of opening.carried) {
+    const close = priorCloses?.prices[symbol];
+    if (!finite(close, 0.01)) return missing(`Previous NSE session close unavailable for ${symbol}`);
+    openingEquity += quantity * close;
+  }
+  if (!(openingEquity > 0) || !Number.isFinite(openingEquity) || !Number.isFinite(equity)) {
+    return missing('Positive opening equity is unavailable for daily sizing');
+  }
+  const pnl = equity - openingEquity - opening.netCashFlow;
+  return {
+    session: opening.session, openingEquity, netCashFlow: opening.netCashFlow, pnl,
+    percent: 100 * pnl / openingEquity, reason: null
+  };
+}
+
+export function portfolioTotals(p: Portfolio, now = new Date(), priorCloses?: PortfolioPriorCloses | null) {
   const marked = p.positions.reduce((n, x) => n + x.quantity * (x.mark ?? x.averagePrice), 0),
     equity = p.cash + marked;
   const reservedCash = p.reservations.reduce((n, x) => n + x.cash, 0),
@@ -121,6 +221,7 @@ export function portfolioTotals(p: Portfolio, now = new Date()) {
     (n, x) => n + x.quantity * ((x.mark ?? x.averagePrice) - x.averagePrice),
     0
   );
+  const staleMarks = p.positions.filter(x => !hasCurrentMark(x, now)).length;
   return {
     equity,
     availableCash: Math.max(0, p.cash - reservedCash),
@@ -129,8 +230,9 @@ export function portfolioTotals(p: Portfolio, now = new Date()) {
     openRisk,
     realizedToday,
     unrealized,
+    dailyEquity: dailyEquity(p, equity, staleMarks, now, priorCloses),
     unknownStops: p.positions.filter((x) => x.stop == null).length,
-    staleMarks: p.positions.filter((x) => !x.markAt || +now - Date.parse(x.markAt) > 20 * 60000).length
+    staleMarks
   };
 }
 export function portfolioSizing(
@@ -139,9 +241,10 @@ export function portfolioSizing(
   sector: string,
   symbol: string,
   regimeRiskPercent: number,
-  now = new Date()
+  now = new Date(),
+  priorCloses?: PortfolioPriorCloses | null
 ) {
-  const totals = portfolioTotals(p, now),
+  const totals = portfolioTotals(p, now, priorCloses),
     reasons: string[] = [];
   if (!p.configured) reasons.push('Configure cash and risk limits first');
   if (!p.reconciledAt || dateToISTString(new Date(p.reconciledAt)) !== dateToISTString(now))
@@ -153,8 +256,13 @@ export function portfolioSizing(
     reasons.push('Position/pending-order limit reached');
   if (p.positions.some((x) => x.symbol === symbol) || p.reservations.some((x) => x.symbol === symbol))
     reasons.push('Existing position or pending entry in this symbol');
-  if (totals.realizedToday <= (-totals.equity * p.policy.dailyLossPercent) / 100)
-    reasons.push('Realized daily loss policy reached');
+  const daily = totals.dailyEquity;
+  if (!finite(p.policy.dailyLossPercent, 0.1, 10)) reasons.push('Set a valid positive daily equity loss limit');
+  else if (daily.reason) reasons.push(daily.reason);
+  else if (daily.pnl !== null && daily.openingEquity !== null &&
+      daily.pnl <= -(daily.openingEquity * p.policy.dailyLossPercent) / 100 + 0.000001) {
+    reasons.push('Daily equity loss limit reached');
+  }
   if (!plan || !plan.accepted) reasons.push('Trade-plan policy does not clear a new entry');
   if (plan && Date.parse(plan.validUntil) <= +now) reasons.push('Entry plan expired');
   if (plan && !plan.tickSize) reasons.push('Current instrument tick size is unavailable');
@@ -265,6 +373,7 @@ export function applyPortfolioAction(
         fail('Risk policy is outside supported bounds');
       if (action.cash < p.reservations.reduce((n, r) => n + r.cash, 0))
         fail('Cash cannot be below reserved cash');
+      event.cashFlow = action.cash - p.cash;
       event.note = `Manual cash reconciliation: ${p.cash} → ${action.cash}; risk policy updated`;
       p.cash = action.cash;
       p.policy = { ...v };
@@ -433,7 +542,7 @@ export function applyPortfolioAction(
         p.reservations.some((x) => x.id === r.id)
       )
         fail('Invalid reservation');
-      if (r.cash > portfolioTotals(p, now).availableCash) fail('Insufficient cash for reservation');
+      if (r.cash > p.cash - p.reservations.reduce((sum, item) => sum + item.cash, 0)) fail('Insufficient cash for reservation');
       p.reservations.push(r);
       event.note = `Manual pending-entry reservation for ${r.symbol}; not a broker order`;
       break;

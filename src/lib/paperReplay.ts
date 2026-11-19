@@ -5,6 +5,7 @@ import {
   type PaperSignal
 } from './ledgerEngine';
 import type { OHLCV } from './indicators';
+import { dateToISTString } from './timezone';
 export interface ReplayCase {
   id: string;
   symbol: string;
@@ -81,10 +82,14 @@ export function replayHoldout(input: {
     const bars = row.bars.map((b) => ({ ...b, date: new Date(b.date) }));
     if (
       bars.some(
-        (b, i) => !Number.isFinite(+b.date) || (i > 0 && +b.date <= +bars[i - 1].date) || b.splitReported
+        (b, i) => !Number.isFinite(+b.date) || (i > 0 && +b.date <= +bars[i - 1].date)
       )
     )
-      throw new Error(`Replay bar ordering or corporate-action consistency requires review: ${row.id}`);
+      throw new Error(`Replay bar ordering requires review: ${row.id}`);
+    const decisionDay = dateToISTString(new Date(decision));
+    if (bars.some(bar => bar.splitReported && (+bar.date > end || dateToISTString(bar.date) < decisionDay))) {
+      throw new Error(`Replay adjustment basis outside the outcome window requires review: ${row.id}`);
+    }
     const outcome = {
       ...evaluatePaperSignal(s, bars, new Date(end)),
       evaluationVersion: PAPER_EVALUATION_VERSION
@@ -94,6 +99,7 @@ export function replayHoldout(input: {
   return {
     source: input.source,
     strategyVersion: input.strategyVersion,
+    corporateActionCoverage: 'Replay checks supplied markers. Historical action coverage and adjustment basis require independent verification.',
     tuneThrough: input.tuneThrough,
     holdoutThrough: input.holdoutThrough,
     submitted: outcomes.length,

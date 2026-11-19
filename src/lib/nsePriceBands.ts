@@ -45,6 +45,7 @@ export function getNsePriceBands(now = new Date()) {
       try {
         const response = await fetch(NSE_PRICE_BANDS_SOURCE, {
           signal: AbortSignal.timeout(4300),
+          cache: 'no-store',
           redirect: 'error'
         });
         const modified = new Date(response.headers.get('last-modified') ?? '');

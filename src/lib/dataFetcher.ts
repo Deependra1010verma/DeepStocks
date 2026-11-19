@@ -3,8 +3,8 @@ import { XMLParser } from "fast-xml-parser";
 import { OHLCV } from "./indicators";
 import { connectDB } from "./db";
 import { StockCache } from "./models/StockCache";
-import { todayIST, dateToISTString, getMarketSession, isContinuous15mBar, latestCompletedSession, shiftDate } from "./timezone";
-import type { AnnualFinancials } from './fundamentalQuality';
+import { todayIST, dateToISTString, getMarketSession, isContinuous15mBar, latestCompletedSession, shiftDate, isCompletedMarketPeriod, cashSessionLimits, sessionTime } from "./timezone";
+import { comparableAnnualPeriods, type AnnualFinancials } from './fundamentalQuality';
 import { assessDataQuality, type DataQuality } from './dataQuality';
 import { beforeDeadline } from './deadline';
 import { completedCloseTime, getCashSession, mergeExchangeClose, restoreCashSpecialSessions } from './nseSessionData';
@@ -15,15 +15,21 @@ import type { SectorBenchmark } from './sectorBenchmarks';
 const yahooFinance = new YahooFinance({ suppressNotices: ["ripHistorical", "yahooSurvey"] });
 const CANDLE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FIFTEEN_MINUTES_MS = 15 * 60_000;
-const DAILY_HISTORY_VERSION = 2;
+const DAILY_HISTORY_VERSION = 4;
+const FUNDAMENTALS_VERSION = 2;
 const CANDLE_HISTORY_DAYS = { '1d': 1750, '1wk': 1900, '1mo': 1900, '15m': 35 };
-const candleMemoryCache = new Map<string, { candles: OHLCV[]; expiresAt: number }>();
-const candleInFlight = new Map<string, Promise<OHLCV[]>>();
+interface CandleSeries {
+  candles: OHLCV[];
+  splitDays: string[];
+}
+const candleMemoryCache = new Map<string, { series: CandleSeries; expiresAt: number }>();
+const candleInFlight = new Map<string, Promise<CandleSeries>>();
 const eventCache = new Map<string, { value: CorporateEventRisk; expires: number }>();
 let yahooWarmup: Promise<void> | null = null;
 let candleWritesInFlight = 0;
 
 export interface FundamentalData {
+  evidenceVersion?: number;
   eventStatus?: 'known' | 'unknown';
   asOf?: string;
   qualityHistoryStatus?: 'verified' | 'unavailable';
@@ -43,6 +49,7 @@ export interface FundamentalData {
 
 export interface StockData {
   dataQuality?: DataQuality;
+  intradayVolumeNote?: string;
   symbol: string;
   sector?: string;
   sectorBenchmark?: SectorBenchmark;
@@ -140,48 +147,19 @@ async function fetchHistoricalCandlesUncached(
   symbol: string,
   interval: "1d" | "1wk" | "1mo" | "15m",
   period1: Date
-): Promise<OHLCV[]> {
+): Promise<CandleSeries> {
   const now = new Date();
-  // period2 must always be set — yahoo-finance2 v4 requires it
-  const period2 = now;
-
-  if (interval === "15m") {
-    // 35 calendar days provide matching historical morning-volume slots.
-    const result = await fetchWithRetry(() =>
-      yahooFinance.chart(symbol, { period1, period2, interval: "15m" }, { fetchOptions: { signal: AbortSignal.timeout(8000) } })
-    );
-    if (!result?.quotes) return [];
-    const lastTrade = result.meta?.regularMarketTime;
-    const cutoff = getMarketSession(now).state === 'LIVE' && lastTrade && Number.isFinite(+lastTrade)
-      ? Math.min(+now, +lastTrade) : +now;
-    return result.quotes
-      .filter(
-        (q) =>
-          +q.date + FIFTEEN_MINUTES_MS <= cutoff &&
-          q.open != null &&
-          q.high != null &&
-          q.low != null &&
-          q.close != null &&
-          q.volume != null
-      )
-      .map((q) => ({
-        open: q.open!,
-        high: q.high!,
-        low: q.low!,
-        close: q.close!,
-        volume: q.volume!,
-        date: new Date(q.date),
-      }));
-  }
-
-  // Daily EMA200 needs roughly a thousand bars to reduce initialization effects.
   const result = await fetchWithRetry(() =>
-    yahooFinance.chart(symbol, { period1, period2, interval, events: 'split' }, { fetchOptions: { signal: AbortSignal.timeout(8000) } })
+    yahooFinance.chart(symbol, { period1, period2: now, interval, events: 'split' }, { fetchOptions: { signal: AbortSignal.timeout(8000) } })
   );
-  if (!result?.quotes) return [];
-  const splitDates=new Set((result.events?.splits??[]).map(s=>dateToISTString(new Date(s.date))));
-  return result.quotes
-    .filter((q) => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
+  if (!result) return { candles:[], splitDays:[] };
+  const lastTrade = result.meta?.regularMarketTime;
+  const cutoff = getMarketSession(now, false).state === 'LIVE' && lastTrade && Number.isFinite(+lastTrade)
+    ? Math.min(+now, +lastTrade) : +now;
+  const splitDays = new Set((result.events?.splits ?? []).map(event => dateToISTString(new Date(event.date))));
+  const candles = (result.quotes ?? [])
+    .filter(q => (interval !== '15m' || +q.date + FIFTEEN_MINUTES_MS <= cutoff) &&
+      q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
     .map((q) => ({
       open: q.open!,
       high: q.high!,
@@ -189,8 +167,13 @@ async function fetchHistoricalCandlesUncached(
       close: q.close!,
       volume: q.volume!,
       date: new Date(q.date),
-      ...(splitDates.has(dateToISTString(new Date(q.date)))?{splitReported:true}:{}),
+      ...(splitDays.has(dateToISTString(new Date(q.date)))?{splitReported:true}:{}),
     }));
+  return { candles, splitDays: [...splitDays] };
+}
+
+function closePhase(at: Date) {
+  return `${latestCompletedSession(at, false)}:${latestCompletedSession(at)}`;
 }
 
 export async function fetchHistoricalCandles(
@@ -198,27 +181,40 @@ export async function fetchHistoricalCandles(
   interval: "1d" | "1wk" | "1mo" | "15m" = "1d",
   period1?: Date
 ): Promise<OHLCV[]> {
+  return (await fetchHistoricalCandleSeries(symbol, interval, period1)).candles;
+}
+
+export async function fetchHistoricalCandleSeries(
+  symbol: string,
+  interval: "1d" | "1wk" | "1mo" | "15m" = "1d",
+  period1?: Date
+): Promise<CandleSeries> {
   const start = period1 ?? new Date(`${dateToISTString(new Date(Date.now() - CANDLE_HISTORY_DAYS[interval] * 86400000))}T00:00:00+05:30`);
-  const key = `${symbol}:${interval}:${start.toISOString()}`;
+  const key = `${symbol}:${interval}:${start.toISOString()}:${interval === '15m' ? '' : closePhase(new Date())}`;
   const cached = candleMemoryCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.candles.map((candle) => ({ ...candle }));
+  if (cached && cached.expiresAt > Date.now()) return {
+    candles: cached.series.candles.map(candle => ({...candle})), splitDays: [...cached.series.splitDays]
+  };
   const running = candleInFlight.get(key);
   if (running) return running;
 
   const requestedAt = Date.now();
   const request = fetchHistoricalCandlesUncached(symbol, interval, start)
-    .then(async (candles) => {
+    .then(async ({candles, splitDays}) => {
       const valid = [...new Map(candles.filter(c => [c.open, c.high, c.low, c.close, c.volume, new Date(c.date).getTime()].every(Number.isFinite) && +new Date(c.date) <= Date.now() + 60000 && c.low > 0 && c.volume >= 0 && c.high >= Math.max(c.open, c.close) && c.low <= Math.min(c.open, c.close)).map(c => [new Date(c.date).getTime(), c])).values()].sort((a, b) => +new Date(a.date) - +new Date(b.date));
       const history = interval === '1d' ? await restoreCashSpecialSessions(symbol,valid) : valid;
+      const series = {candles:history, splitDays};
       if (candleMemoryCache.size > 1000) for (const [k, v] of candleMemoryCache) if (v.expiresAt <= Date.now()) candleMemoryCache.delete(k);
-      if (history.length > 0) {
+      if (history.length > 0 || splitDays.length > 0) {
         const now = Date.now();
+        const day = dateToISTString(new Date(requestedAt));
+        const sessionOpen = +sessionTime(day, cashSessionLimits(day).continuousStart);
         const expiresAt = interval === '15m'
-          ? Math.min(now + CANDLE_CACHE_TTL_MS, (Math.floor(requestedAt / FIFTEEN_MINUTES_MS) + 1) * FIFTEEN_MINUTES_MS)
+          ? Math.min(now + CANDLE_CACHE_TTL_MS, sessionOpen + (Math.floor((requestedAt - sessionOpen) / FIFTEEN_MINUTES_MS) + 1) * FIFTEEN_MINUTES_MS)
           : now + CANDLE_CACHE_TTL_MS;
-        candleMemoryCache.set(key, { candles: history, expiresAt });
+        candleMemoryCache.set(key, { series, expiresAt });
       }
-      return history;
+      return series;
     })
     .finally(() => candleInFlight.delete(key));
   candleInFlight.set(key, request);
@@ -250,23 +246,32 @@ export async function fetchFundamentals(symbol: string): Promise<FundamentalData
 
   if (!result && !quote) return { ...EMPTY_FUNDAMENTALS };
   const events = parseCalendarEvents(result);
-  const byYear = new Map<string, Record<string, unknown>>();
-  for (const item of annual ?? []) {
-    const date = new Date(item.date).toISOString().slice(0, 10);
-    byYear.set(date, { ...byYear.get(date), ...item });
-  }
-  const annualHistory: AnnualFinancials[] = [...byYear].map(([date, item]) => ({ date, revenue: numberFrom(item.totalRevenue), profit: numberFrom(item.netIncome), operatingCashFlow: numberFrom(item.operatingCashFlow), debt: numberFrom(item.totalDebt), equity: numberFrom(item.stockholdersEquity), shares: numberFrom(item.ordinarySharesNumber) }));
+  // Yahoo supplies period end and period type here. Filing publication and
+  // point-in-time availability cannot be inferred from either field.
+  const annualHistory: AnnualFinancials[] = (annual ?? []).map(item => {
+    const periodEnd = new Date(item.date);
+    const financials = item as unknown as Record<string, unknown>;
+    return {
+      date: item.periodType === '12M' && Number.isFinite(+periodEnd) ? periodEnd.toISOString().slice(0, 10) : '',
+      revenue: numberFrom(financials.totalRevenue), profit: numberFrom(financials.netIncome),
+      operatingCashFlow: numberFrom(financials.operatingCashFlow), debt: numberFrom(financials.totalDebt),
+      equity: numberFrom(financials.stockholdersEquity), shares: numberFrom(financials.ordinarySharesNumber)
+    };
+  });
+  const now = new Date();
+  const {years} = comparableAnnualPeriods(annualHistory, now);
   return {
-    revenueGrowth: fd?.revenueGrowth ?? numberFrom(q.revenueGrowth),
-    earningsGrowth: fd?.earningsGrowth ?? numberFrom(q.earningsGrowth),
-    returnOnEquity: fd?.returnOnEquity ?? numberFrom(q.returnOnEquity),
-    debtToEquity: fd?.debtToEquity ?? numberFrom(q.debtToEquity),
-    profitMargins: fd?.profitMargins ?? numberFrom(q.profitMargins),
+    revenueGrowth: numberFrom(fd?.revenueGrowth, q.revenueGrowth),
+    earningsGrowth: numberFrom(fd?.earningsGrowth, q.earningsGrowth),
+    returnOnEquity: numberFrom(fd?.returnOnEquity, q.returnOnEquity),
+    debtToEquity: numberFrom(fd?.debtToEquity, q.debtToEquity),
+    profitMargins: numberFrom(fd?.profitMargins, q.profitMargins),
     forwardPE: numberFrom(dks?.forwardPE,q.forwardPE),
     marketCap: numberFrom(q.marketCap),
     ...events,
-    asOf: new Date().toISOString(),
-    qualityHistoryStatus: annualHistory.length >= 3 ? 'verified' : 'unavailable',
+    asOf: now.toISOString(),
+    evidenceVersion: FUNDAMENTALS_VERSION,
+    qualityHistoryStatus: years?.every(row => [row.revenue,row.profit,row.operatingCashFlow,row.debt,row.equity,row.shares].every(Number.isFinite)) ? 'verified' : 'unavailable',
     annualHistory,
     source: result ? "quoteSummary" : "quote",
   };
@@ -333,14 +338,13 @@ export async function batchFetchStockData(
   options: {
     withBtstConfirmation?: boolean;
     sessionInstruments?: Promise<ReadonlyMap<string, { casEligible: boolean }>>;
+    historicalCasEligibility?: ReadonlyMap<string, ReadonlyMap<string, boolean>>;
   } = {},
 ): Promise<StockDataBatch> {
   const results = Object.assign(new Map<string, StockData>(), { coverage: { attempted: [], failed: [], deferred: [] } as BatchCoverage });
   const unique = [...new Set(symbols)], attempted = new Set<string>();
   const today = todayIST();
-  const startedAt = new Date(), exchangeSession=getMarketSession(startedAt);
-  const completedDay=latestCompletedSession(startedAt);
-  const checkBtst=options.withBtstConfirmation&&isBtstWindow(startedAt);
+  const startedAt = new Date();
   const instruments = options.sessionInstruments?.catch(() => undefined);
   const confirmationStart=new Date(shiftDate(today,-2)+'T09:15:00+05:30');
   const alive = () => !signal?.aborted && Date.now() < deadline;
@@ -362,70 +366,103 @@ export async function batchFetchStockData(
           try {
             const cached = await beforeDeadline(() => StockCache.findOne({ symbol, date: today }).maxTimeMS(700).lean<{candles?: OHLCV[]; fundamentals?: FundamentalData; updatedAt?: Date; historyVersion?: number}>(), Math.min(symbolDeadline, Date.now() + 900), signal);
             const fresh = cached?.updatedAt && Date.now() - +new Date(cached.updatedAt) < CANDLE_CACHE_TTL_MS;
-            if (fresh && cached?.historyVersion === DAILY_HISTORY_VERSION && cached.candles && cached.candles.length >= 20) cachedCandles = cached.candles.map(c => ({ ...c, date: new Date(c.date) }));
-            if (fresh && cached?.fundamentals?.asOf && Date.now() - Date.parse(cached.fundamentals.asOf) < CANDLE_CACHE_TTL_MS) cachedFundamentals = cached.fundamentals;
+            if (fresh && cached?.updatedAt && closePhase(new Date(cached.updatedAt)) === closePhase(startedAt) &&
+                cached.historyVersion === DAILY_HISTORY_VERSION && cached.candles && cached.candles.length >= 20) {
+              cachedCandles = cached.candles.map(c => ({ ...c, date: new Date(c.date) }));
+            }
+            if (fresh && cached?.fundamentals?.evidenceVersion === FUNDAMENTALS_VERSION && cached.fundamentals.asOf &&
+                Date.now() - Date.parse(cached.fundamentals.asOf) < CANDLE_CACHE_TTL_MS) cachedFundamentals = cached.fundamentals;
           } catch { /* A cache miss must not block the entire scan. */ }
         }
+        const confirmationRequest = options.withBtstConfirmation
+          ? Promise.resolve(instruments).then(master => {
+            const cas = master?.get(symbol)?.casEligible ?? null;
+            return isBtstWindow(startedAt, cas) ? fetchHistoricalCandles(symbol, '15m', confirmationStart) : [];
+          }) : [];
         const [candles, quote, fundamentals, weekly, monthly, confirmation, sessionInstruments] = await beforeDeadline(() => Promise.all([
           cachedCandles ? Promise.resolve(cachedCandles) : fetchHistoricalCandles(symbol, interval),
           fetchQuote(symbol),
           withFundamentals ? cachedFundamentals ? Promise.resolve(cachedFundamentals) : fetchFundamentals(symbol) : Promise.resolve({ ...EMPTY_FUNDAMENTALS }),
           withWeekly ? fetchHistoricalCandles(symbol, '1wk') : Promise.resolve([]),
           withFundamentals ? fetchHistoricalCandles(symbol, '1mo') : Promise.resolve([]),
-          checkBtst ? fetchHistoricalCandles(symbol,'15m',confirmationStart) : Promise.resolve([]),
-          interval === '15m' ? instruments : undefined,
+          confirmationRequest,
+          instruments,
         ]), symbolDeadline, signal);
         if (!alive() || candles.length < 20) continue;
         const now = new Date();
+        const date = dateToISTString(now);
+        const historical = options.historicalCasEligibility?.get(symbol);
+        const casForDay = (day: string) => (day === today ? sessionInstruments?.get(symbol)?.casEligible : undefined) ?? historical?.get(day) ?? null;
+        const cas = casForDay(date);
+        const exchangeSession = getMarketSession(now, cas);
+        const completedDay = latestCompletedSession(now, cas);
+        const quoteDay = quote?.regularMarketTime ? dateToISTString(new Date(quote.regularMarketTime)) : date;
+        const evidenceDay = exchangeSession.state === 'LIVE' || exchangeSession.state === 'UNKNOWN' ? date : completedDay ?? quoteDay;
+        const evidenceCas = casForDay(evidenceDay);
+        const eligibility = evidenceCas === null ? undefined : { day: evidenceDay, casEligible: evidenceCas };
+        const delay = typeof quote?.exchangeDataDelayedBy === 'number' ? quote.exchangeDataDelayedBy : null;
         let usableCandles = candles;
+        let intradayVolumeNote: string | undefined;
         if (interval === '15m') {
-          const eligibility = sessionInstruments?.get(symbol)?.casEligible ?? null;
-          const intradayCutoff = getMarketSession(now, eligibility).state === 'LIVE' && quote?.regularMarketTime
+          const intradayCutoff = exchangeSession.state === 'LIVE' && quote?.regularMarketTime
             ? Math.min(+now, +new Date(quote.regularMarketTime)) : +now;
+          let unverifiedHistoricalSlots = false;
           usableCandles = candles.filter(candle => {
             const at = new Date(candle.date);
-            // The instrument master verifies CAS eligibility for today only.
-            const casEligible = dateToISTString(at) === today ? eligibility : null;
-            return +at + FIFTEEN_MINUTES_MS <= intradayCutoff && isContinuous15mBar(at, casEligible);
+            if (+at + FIFTEEN_MINUTES_MS > intradayCutoff) return false;
+            const day = dateToISTString(at), datedCas = casForDay(day);
+            const valid = isContinuous15mBar(at, datedCas);
+            if (day < quoteDay && datedCas === null && !valid && isContinuous15mBar(at, false)) unverifiedHistoricalSlots = true;
+            return valid;
           });
+          if (unverifiedHistoricalSlots && usableCandles.some(bar => dateToISTString(bar.date) === quoteDay &&
+              isContinuous15mBar(bar.date, false) && !isContinuous15mBar(bar.date))) {
+            intradayVolumeNote = 'Comparable closing-slot RVOL requires dated historical CAS eligibility';
+          }
         }
         const hasCompletedBar=(bars:OHLCV[])=>!!completedDay&&bars.some(
           bar=>dateToISTString(new Date(bar.date))===completedDay
         );
         let exchangeClose, candleSource:DataQuality['candleSource']='Yahoo';
-        if(interval==='1d'&&completedDay&&exchangeSession.calendarVerified&&!hasCompletedBar(candles)) {
+        let mergedOfficial = false;
+        const closed = exchangeSession.state === 'CLOSED' || exchangeSession.state === 'PRE_OPEN';
+        const crossedClose = interval === '1d' && completedDay === date && latestCompletedSession(startedAt, cas) !== completedDay;
+        let quality = assessDataQuality(quote?.regularMarketTime ?? null, usableCandles.at(-1)?.date ?? null, delay, interval === '15m', now, eligibility);
+        if(interval==='1d'&&completedDay&&exchangeSession.calendarVerified&&(!hasCompletedBar(candles)||(closed&&(quality.stale||crossedClose)))) {
           const report=await beforeDeadline(()=>getCashSession(completedDay),Math.min(deadline,Date.now()+5200),signal).catch(()=>null);
           const row=report?.get(symbol);
           const merged=row&&mergeExchangeClose(candles,row,completedDay);
           if(merged&&row){
+            mergedOfficial = true;
             usableCandles=merged;
             if(dateToISTString(new Date(merged.at(-1)!.date))===completedDay)candleSource='NSE EOD';
-            if(exchangeSession.state==='CLOSED'||exchangeSession.state==='PRE_OPEN')exchangeClose=row;
+            if(closed)exchangeClose=row;
           }
         }
         if(!alive()||(!quote&&!exchangeClose))continue;
         if (usableCandles.length < 20) continue;
-        const completedWeekly = weekly.filter(c => {
-          const d = new Date(c.date), daysToFriday = (5 - d.getUTCDay() + 7) % 7;
-          return +d + daysToFriday * 86400000 + 23400000 <= +now;
-        });
+        const completedWeekly = weekly.filter(c => isCompletedMarketPeriod(c.date, '1wk', startedAt));
         const dayChange=exchangeClose?exchangeClose.candle.close-exchangeClose.previousClose!:(quote?.regularMarketChange??0);
-        const quality=assessDataQuality(
-          exchangeClose&&completedDay?completedCloseTime(completedDay):quote?.regularMarketTime??null,
-          usableCandles.at(-1)?.date??null,
-          exchangeClose?0:typeof quote?.exchangeDataDelayedBy==='number'?quote.exchangeDataDelayedBy:null,
-          interval==='15m',
-          new Date()
-        );
+        if (mergedOfficial) {
+          quality = assessDataQuality(
+            exchangeClose && completedDay ? completedCloseTime(completedDay, evidenceCas) : quote?.regularMarketTime ?? null,
+            usableCandles.at(-1)?.date ?? null, exchangeClose ? 0 : delay, false, now, eligibility
+          );
+        }
         if(interval==='1d'&&completedDay&&!hasCompletedBar(usableCandles)) {
           quality.stale=true;
           quality.issues.push('Latest completed daily candle unavailable');
         }
+        if (crossedClose && !mergedOfficial) {
+          quality.stale = true;
+          quality.issues.push('Daily history request crossed the close without a verified final candle');
+        }
         const restoredCashSessions = usableCandles.filter(bar=>bar.restoredFromNse).map(bar=>dateToISTString(new Date(bar.date)));
         results.set(symbol, {
           symbol, candles: usableCandles, weeklyCandles: withWeekly ? completedWeekly : undefined,
-          confirmationCandles:checkBtst?confirmation:undefined,
-          monthlyCandles: monthly.filter(c => dateToISTString(new Date(c.date)).slice(0, 7) < dateToISTString(now).slice(0, 7)),
+          confirmationCandles: options.withBtstConfirmation ? confirmation : undefined,
+          monthlyCandles: monthly.filter(c => isCompletedMarketPeriod(c.date, '1mo', startedAt)),
+          ...(intradayVolumeNote ? { intradayVolumeNote } : {}),
           dataQuality: {...quality,quoteSource:exchangeClose?'NSE EOD':'Yahoo',candleSource,
             ...(restoredCashSessions.length ? { restoredCashSessions } : {}) },
           fundamentals, currentPrice: exchangeClose?.candle.close ?? quote?.regularMarketPrice ?? usableCandles.at(-1)!.close,
@@ -440,7 +477,7 @@ export async function batchFetchStockData(
           // the real write settles, so optional caches cannot flood the pool
           // needed to save progress and release the scan lease.
           candleWritesInFlight++;
-          const write = Promise.resolve().then(() => StockCache.updateOne({ symbol, date: today }, { $set: { symbol, date: today, candles, historyVersion: DAILY_HISTORY_VERSION, ...(withFundamentals ? { fundamentals } : {}), updatedAt: now } }, { upsert: true, maxTimeMS: 700, strict: false })).finally(() => { candleWritesInFlight--; });
+          const write = Promise.resolve().then(() => StockCache.updateOne({ symbol, date: today }, { $set: { symbol, date: today, candles, historyVersion: DAILY_HISTORY_VERSION, ...(withFundamentals ? { fundamentals } : {}), updatedAt: startedAt } }, { upsert: true, maxTimeMS: 700, strict: false })).finally(() => { candleWritesInFlight--; });
           await beforeDeadline(() => write, Math.min(deadline, Date.now() + 900), signal).catch(() => undefined);
         }
       } catch { /* Count this attempted symbol as failed, then continue if time remains. */ }

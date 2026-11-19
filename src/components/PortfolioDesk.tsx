@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   DEFAULT_RISK_POLICY,
   holdingQuantityDifferences,
+  type portfolioTotals,
   type Portfolio,
   type PortfolioAction,
   type RiskPolicy
@@ -17,6 +18,7 @@ type Payload = {
     openRisk: number;
     reservedRisk: number;
     realizedToday: number;
+    dailyEquity: ReturnType<typeof portfolioTotals>['dailyEquity'];
   };
   reviews: Array<{ id: string; actions: string[] }>;
 };
@@ -71,7 +73,7 @@ export default function PortfolioDesk() {
     setJournalLoading(true);
     setError('');
     try {
-      const r = await fetch('/api/portfolio', { signal: AbortSignal.timeout(12000) }),
+      const r = await fetch('/api/portfolio', { signal: AbortSignal.timeout(14000) }),
         d = await r.json();
       if (!r.ok) throw new Error(d.error);
       setData(d);
@@ -241,6 +243,13 @@ export default function PortfolioDesk() {
                   </div>
                 ))}
               </div>
+              {data.totals.dailyEquity && (
+                <p className="text-xs text-slate-400" role="status">
+                  {data.totals.dailyEquity.reason
+                    ? `Daily equity P&L unavailable. ${data.totals.dailyEquity.reason}.`
+                    : `Daily equity P&L ₹${data.totals.dailyEquity.pnl?.toFixed(2)} (${data.totals.dailyEquity.percent?.toFixed(2)}%) on opening equity ₹${data.totals.dailyEquity.openingEquity?.toFixed(2)}. Cash adjustments excluded.`}
+                </p>
+              )}
               <form
                 className="rounded-xl border border-slate-800 p-4 space-y-3"
                 onSubmit={(e) => {
@@ -272,7 +281,7 @@ export default function PortfolioDesk() {
                       ['totalRiskPercent', 'Total open risk %'],
                       ['sectorPercent', 'Sector exposure %'],
                       ['maxPositions', 'Max positions + pending'],
-                      ['dailyLossPercent', 'Realized daily loss halt %']
+                      ['dailyLossPercent', 'Daily equity loss halt %']
                     ] as const
                   ).map(([key, label]) => (
                     <label key={key}>
@@ -282,6 +291,7 @@ export default function PortfolioDesk() {
                         className={field}
                         type="number"
                         step={key === 'maxPositions' ? '1' : '0.1'}
+                        min={key === 'dailyLossPercent' ? '0.1' : undefined}
                         value={policy[key]}
                         onChange={(e) => setPolicy({ ...policy, [key]: Number(e.target.value) })}
                       />

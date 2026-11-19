@@ -31,32 +31,31 @@ export async function getMarketRegime(): Promise<MarketRegimeSnapshot> {
   const completedDay = latestCompletedSession(now);
   const sessionKey = `${dateToISTString(now)}:${session.state}:${completedDay}`;
   if (cached && cached.sessionKey === sessionKey && cached.expiresAt > +now) return cached.value;
-  const [niftyHistory, niftyQuote, vixQuote, vixHistory] = await Promise.all([
+  const live = session.state === 'LIVE';
+  const [niftyHistory, niftyQuote, vixQuote, closedReport] = await Promise.all([
     fetchHistoricalCandles("^NSEI", "1d", new Date(+now - 180 * 86400000)),
-    session.state==='LIVE'?fetchQuote('^NSEI'):Promise.resolve(null),
-    fetchQuote("^INDIAVIX"),
-    fetchHistoricalCandles("^INDIAVIX", "1d", new Date(+now - 10 * 86400000))
+    live ? fetchQuote('^NSEI') : null,
+    live ? fetchQuote("^INDIAVIX") : null,
+    !live && session.calendarVerified && session.state !== 'UNKNOWN' ? getIndexSession(completedDay) : null
   ]);
   const niftyCompleted = niftyHistory.filter(bar=>completedDay&&dateToISTString(new Date(bar.date))<=completedDay);
   const validSession = (bar:typeof niftyHistory[number]|undefined)=>!!bar&&!!completedDay&&dateToISTString(new Date(bar.date))===completedDay;
-  const needIndexReport = !validSession(niftyCompleted.at(-1)) || (session.state!=='LIVE'&&!validSession(vixHistory.at(-1)));
-  const official = needIndexReport&&session.calendarVerified?await getIndexSession(completedDay):null;
+  const official = live && !validSession(niftyCompleted.at(-1)) ? await getIndexSession(completedDay) : closedReport;
   const officialNifty=official?.get('^NSEI');
-  const niftyCandles=completedDay&&officialNifty&&!validSession(niftyCompleted.at(-1))
-    ? mergeExchangeClose(niftyCompleted,officialNifty,completedDay)??niftyCompleted : niftyCompleted;
+  const mergedNifty = completedDay && officialNifty ? mergeExchangeClose(niftyCompleted, officialNifty, completedDay) : null;
+  const niftyCandles = mergedNifty ?? niftyCompleted;
   const niftyCloses=niftyCandles.map(bar=>bar.close);
   const niftyEma20=last(calcEMA(niftyCloses,20));
   const niftyEma50=last(calcEMA(niftyCloses,50));
-  const live=session.state==='LIVE';
   const quoteFresh=(quote:typeof vixQuote)=>!!quote&&!assessDataQuality(
     quote.regularMarketTime??null,quote.regularMarketTime??null,
     typeof quote.exchangeDataDelayedBy==='number'?quote.exchangeDataDelayedBy:null,false,now
   ).stale;
-  const niftyClose=live?(niftyQuote?.regularMarketPrice??null):last(niftyCloses);
+  const niftyClose=live?(niftyQuote?.regularMarketPrice??null):officialNifty?.candle.close ?? null;
   const vixClose=live?(vixQuote?.regularMarketPrice??null):
-    (official?.get('^INDIAVIX')?.candle.close??last(vixHistory.map(bar=>bar.close))??vixQuote?.regularMarketPrice??null);
-  const indexFresh=validSession(niftyCandles.at(-1))&&(!live||quoteFresh(niftyQuote));
-  const vixFresh=live?quoteFresh(vixQuote):!!official?.get('^INDIAVIX')||validSession(vixHistory.at(-1));
+    (official?.get('^INDIAVIX')?.candle.close??null);
+  const indexFresh=validSession(niftyCandles.at(-1))&&(live?quoteFresh(niftyQuote):!!mergedNifty);
+  const vixFresh=live?quoteFresh(vixQuote):!!official?.get('^INDIAVIX');
   const bullish = niftyClose != null && niftyEma20 != null && niftyEma50 != null &&
     niftyClose > niftyEma20 && niftyEma20 > niftyEma50 && vixClose != null && vixClose < 16;
   const available = session.calendarVerified&&indexFresh&&vixFresh&&

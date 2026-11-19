@@ -17,10 +17,12 @@ import AccessGate from '@/components/AccessGate';
 import OperationsStatus from '@/components/OperationsStatus';
 import { guardFingerprint, priceMovedBeyondCache, ANALYSIS_VERSION } from '@/lib/aiCachePolicy';
 import { getTradePlan } from '@/lib/tradePlan';
+import { referenceEntryReasons } from '@/lib/entryClearance';
+import { qualifiesForShortlist } from '@/lib/strategyPolicy';
 import { recheckDataQuality } from '@/lib/dataQuality';
 import { clientProviderVersion, clientAIConfigured } from '@/lib/clientProvider';
 import { beforeDeadline } from '@/lib/deadline';
-import { getMarketSession } from '@/lib/timezone';
+import { dateToISTString, getMarketSession } from '@/lib/timezone';
 import type { RemovedScanStock } from "@/lib/models/ScanSnapshot";
 
 const CandlestickChart = dynamic(() => import("@/components/CandlestickChart"), {
@@ -111,6 +113,18 @@ function browserCacheKey(stock: ScreenedStock, regime: string) {
   return `${BROWSER_CACHE_PREFIX}${clientProviderVersion()}:${stock.symbol}:${stock.mode}:${regime}`;
 }
 
+function evidenceTime(stock: ScreenedStock) {
+  return Date.parse(stock.dataQuality?.fetchedAt ?? '') || 0;
+}
+
+function isOlderStock(incoming: ScreenedStock, current: ScreenedStock) {
+  if (incoming.symbol !== current.symbol || incoming.mode !== current.mode) return true;
+  const delta = evidenceTime(incoming) - evidenceTime(current);
+  return delta < 0 || (delta === 0 && (
+    incoming.cmp !== current.cmp || guardFingerprint(incoming) !== guardFingerprint(current)
+  ));
+}
+
 function readBrowserAnalysis(stock: ScreenedStock, regime: string): BrowserAnalysisCacheEntry | null {
   const key = browserCacheKey(stock, regime);
   let entry = browserAnalysisCache.get(key);
@@ -191,7 +205,9 @@ function formatIST(value?: string) {
 function Dashboard() {
   const [clockNow, setClockNow] = useState(0);
   useEffect(() => { const tick=()=>setClockNow(Date.now()); tick(); const timer=window.setInterval(tick,30000); return ()=>window.clearInterval(timer); }, []);
-  const [scanError, setScanError] = useState<string|null>(null);
+  const [refreshError, setScanError] = useState<string|null>(null);
+  const [snapshotError, setSnapshotError] = useState<string|null>(null);
+  const scanError = snapshotError ?? refreshError;
   const [scanNotice, setScanNotice] = useState<string|null>(null);
   const [scanStatus, setScanStatus] = useState<ScanPayload['status']>();
   const [snapshotLoaded, setSnapshotLoaded] = useState(false);
@@ -217,6 +233,11 @@ function Dashboard() {
   const [scanLoading, setScanLoading]   = useState(false);
   const [refreshing, setRefreshing]     = useState(false);
   const [selectedStock, setSelectedStock] = useState<ScreenedStock | null>(null);
+  const selectedStockRef = useRef<ScreenedStock | null>(null);
+  const showStock = useCallback((stock: ScreenedStock | null) => {
+    selectedStockRef.current = stock;
+    setSelectedStock(stock);
+  }, []);
   const [chartLoading, setChartLoading] = useState(false);
   const [analysis, setAnalysis]         = useState<AIAnalysisResult | null>(null);
   const [analysisMeta, setAnalysisMeta] = useState<AnalysisMeta | null>(null);
@@ -273,8 +294,20 @@ function Dashboard() {
 
   const applyScanPayload = useCallback((data: ScanPayload) => {
     if (!Array.isArray(data.stocks)) return;
-    // Scan snapshots supply the list. The detail view owns its independently fetched stock and request.
     setStocks(data.stocks);
+    const current = selectedStockRef.current;
+    const updated = current && data.stocks.find(stock => stock.symbol === current.symbol && stock.mode === current.mode);
+    if (current && updated && evidenceTime(updated) > evidenceTime(current) &&
+        (guardFingerprint(updated) !== guardFingerprint(current) || priceMovedBeyondCache(current.mode, current.cmp, updated.cmp))) {
+      const sameCandles = updated.dataQuality?.candleAt &&
+        updated.dataQuality.candleAt === current.dataQuality?.candleAt &&
+        updated.dataQuality.candleSource === current.dataQuality?.candleSource;
+      showStock({ ...updated, candles: updated.candles.length || !sameCandles ? updated.candles : current.candles });
+      setPaperSaved(false);
+      setAnalysis(null);
+      setAnalysisMeta(null);
+      setAnalysisError({ message: 'Setup updated. Refresh the explanation using current data.' });
+    }
     setCoverage(data.coverage);
     setSnapshotLoaded(true); snapshotShown.current = true;
     const isNewSnapshot = Boolean(data.generatedAt && data.generatedAt !== snapshotStamp.current);
@@ -285,7 +318,7 @@ function Dashboard() {
       setSnapshotMeta({ generatedAt: data.generatedAt, expiresAt: data.expiresAt, cached: Boolean(data.cached) });
     }
     if (isNewSnapshot) prefetchTopAnalyses(data.stocks);
-  }, [prefetchTopAnalyses]);
+  }, [prefetchTopAnalyses, showStock]);
 
   const refreshInBackground = useCallback(async () => {
     const generation = scanGeneration.current;
@@ -338,6 +371,7 @@ function Dashboard() {
     try {
       const data = await fetchSnapshotPayload(selectedMode, selectedSector);
       if (generation !== scanGeneration.current) return;
+      setSnapshotError(null);
       const changed = Boolean(data.generatedAt && data.generatedAt !== snapshotStamp.current);
       applyScanPayload(data);
       if (data.message) setScanNotice(data.message);
@@ -346,7 +380,7 @@ function Dashboard() {
       }
       if (data.needsRefresh || data.stale) void refreshInBackground();
     } catch {
-      if (generation === scanGeneration.current) setScanError('Could not load the scan snapshot. Saved results are retained; retry refresh.');
+      if (generation === scanGeneration.current) setSnapshotError('Could not load the scan snapshot. Saved results are retained; retry refresh.');
     } finally {
       snapshotInFlight.current.delete(snapshotKey);
       if (generation === scanGeneration.current) setScanLoading(false);
@@ -371,10 +405,10 @@ function Dashboard() {
     for (const controller of refreshControllers.current.values()) controller.abort();
     refreshControllers.current.clear(); refreshInFlight.current.clear();
     snapshotShown.current = false; snapshotStamp.current = undefined; setSnapshotLoaded(false); setScanLoading(false); setRefreshing(false);
-    setScanError(null); setScanNotice(null); setScanStatus(undefined);
+    setScanError(null); setSnapshotError(null); setScanNotice(null); setScanStatus(undefined);
     analysisController.current?.abort();
     setChartLoading(false);
-    setSelectedMode(mode); setSelectedSector(sector); setSelectedStock(null); setAnalysis(null); setAnalysisMeta(null); setAnalysisError(null); setAnalysisLoading(false); setStocks([]); setRemovedToday([]); setSnapshotMeta(null); setCoverage(undefined); setMobilePanel('results'); setSearchError(null);
+    setSelectedMode(mode); setSelectedSector(sector); showStock(null); setAnalysis(null); setAnalysisMeta(null); setAnalysisError(null); setAnalysisLoading(false); setStocks([]); setRemovedToday([]); setSnapshotMeta(null); setCoverage(undefined); setMobilePanel('results'); setSearchError(null);
   };
   const runScan = () => { void refreshInBackground(); };
 
@@ -382,7 +416,7 @@ function Dashboard() {
     analysisController.current?.abort();
     const requestId = ++analysisRequestId.current;
     const regime = marketRegimeRef.current;
-    setSelectedStock(stock);setMobilePanel("detail");setPaperSaved(false);
+    showStock(stock);setMobilePanel("detail");setPaperSaved(false);
     setAnalysis(null);
     setAnalysisMeta(null);
     setAnalysisError(null);
@@ -394,7 +428,7 @@ function Dashboard() {
         const browserCached = readBrowserAnalysis(stock, regime);
         if (browserCached) {
           setAnalysis(browserCached.analysis);
-          setSelectedStock(browserCached.stock);
+          if (!stock.candles.length) showStock({ ...stock, candles: browserCached.stock.candles });
           setAnalysisMeta({ cached: true, cachedAt: browserCached.cachedAt, expiresAt: browserCached.expiresAt });
           setAnalysisLoading(false);
           return;
@@ -417,8 +451,12 @@ function Dashboard() {
           setAnalysisError({ message: payload.error ?? 'Could not load the chart and updated quant data.', code: payload.code ?? 'DATA_UNAVAILABLE' });
           return;
         }
+        if (selectedStockRef.current && isOlderStock(payload.stock, selectedStockRef.current)) {
+          setAnalysisError({ message: 'Setup updated. Refresh the explanation using current data.' });
+          return;
+        }
         currentStock = payload.stock;
-        setSelectedStock(currentStock);
+        showStock(currentStock);
         setChartLoading(false);
       }
       const res = await fetch("/api/analyze", {
@@ -429,11 +467,18 @@ function Dashboard() {
       });
       const data = await res.json();
       if (requestId !== analysisRequestId.current) return;
-      if (data.stock) setSelectedStock(data.stock);
+      const latest = selectedStockRef.current;
+      if ((data.stock && latest && isOlderStock(data.stock, latest)) ||
+          (res.ok && data.analysis && (!data.stock || data.fingerprint !== guardFingerprint(data.stock)))) {
+        setAnalysisError({ message: 'Setup updated. Refresh the explanation using current data.' });
+        return;
+      }
+      if (data.stock) showStock(data.stock);
       if (!res.ok || !data.analysis) {
         setAnalysisError({ message: data.error ?? "Analysis failed. Please try again.", code: data.code });
         return;
       }
+      setAnalysisError(null);
       setAnalysis(data.analysis);
       if (data.cachedAt && data.expiresAt) {
         setAnalysisMeta({ cached: Boolean(data.cached), cachedAt: data.cachedAt, expiresAt: data.expiresAt });
@@ -457,7 +502,7 @@ function Dashboard() {
         setChartLoading(false);
       }
     }
-  }, []);
+  }, [showStock]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -524,16 +569,21 @@ function Dashboard() {
     const newlyStale = current?.stale && !source?.stale;
     const marketBlocked = marketDataUnavailable && selectedStock.mode!=='longterm';
     const shortHorizon=selectedStock.mode==='intraday'||selectedStock.mode==='btst';
-    const sessionEnded=shortHorizon&&clockNow>0&&getMarketSession(new Date(clockNow),selectedStock.casEligible??null).state!=='LIVE';
+    const now = new Date(clockNow);
+    const cas = selectedStock.tickSizeAsOf === dateToISTString(now) ? selectedStock.casEligible ?? null : null;
+    const sessionEnded=shortHorizon&&clockNow>0&&getMarketSession(now,cas).state!=='LIVE';
     const detailsPending=!selectedStock.candles.length;
-    if (!newlyStale && !marketBlocked && !sessionEnded && !detailsPending) return selectedStock;
+    const referenceReasons = clockNow > 0 ? referenceEntryReasons(selectedStock, now) : [];
+    if (!newlyStale && !marketBlocked && !sessionEnded && !detailsPending && !referenceReasons.length) return selectedStock;
     return {
       ...selectedStock,
       nearMiss: true,
+      positionRiskPercent: 0,
       researchQualified: !newlyStale&&selectedStock.researchQualified,
       dataQuality: current,
       guardReasons: [...new Set([
         ...(selectedStock.guardReasons ?? []),
+        ...referenceReasons,
         ...(newlyStale ? current.issues : []),
         ...(marketBlocked ? ['Nifty/VIX data unavailable'] : []),
         ...(sessionEnded ? ['Continuous trading session is not confirmed open'] : []),
@@ -549,8 +599,8 @@ function Dashboard() {
     analysisError?.code === 'INSUFFICIENT_HISTORY';
   const budgetPaused = analysisError?.code === 'AI_DAILY_LIMIT';
 
-  const qualifiedCount = stocks.filter(s => !s.nearMiss || s.researchQualified).length;
-  const nearMissCount = stocks.filter(s => s.nearMiss && !s.researchQualified).length;
+  const qualifiedCount = stocks.filter(qualifiesForShortlist).length;
+  const nearMissCount = stocks.length - qualifiedCount;
   const selectedPlan = selectedStock?.candles.length ? getTradePlan(selectedStock) : null;
 
   return (
@@ -792,6 +842,7 @@ function Dashboard() {
               {chartLoading && <div role="status" className="absolute inset-0 z-10 grid place-items-center bg-slate-950/80 text-xs text-cyan-300">Loading stock candles…</div>}
               <CandlestickChart
                 candles={selectedStock?.candles ?? []}
+                interval={selectedStock?.mode === 'intraday' ? '15m' : '1d'}
                 ema20={selectedStock?.ema20 ?? 0}
                 ema50={selectedStock?.ema50 ?? 0}
                 ema200={selectedStock?.ema200 ?? 0}

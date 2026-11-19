@@ -7,8 +7,8 @@ import { AppError } from './operations';
 import { getInstrumentMaster, instrumentMap } from './marketReference';
 import { beforeDeadline } from './deadline';
 import { getSectorBenchmarks, usesSectorBenchmark } from './sectorBenchmarks';
-import { getNseEvents } from './nseCorporateEvents';
-import { getNseSurveillance } from './nseSurveillance';
+import { getNseEventReports } from './nseCorporateEvents';
+import { getNseSurveillanceReports } from './nseSurveillance';
 import { getNsePriceBands } from './nsePriceBands';
 export const MODES: ScreenerMode[] = ['intraday','btst','swing_breakout','swing_pullback','positional','longterm'];
 export function validMode(value: unknown): ScreenerMode {
@@ -31,13 +31,13 @@ export async function resolveStock(symbol: string, mode: ScreenerMode): Promise<
     const [data,market,instruments,benchmarks,events,surveillance,priceBands] = await Promise.all([
       batchFetchStockData([symbol], mode==='intraday'?'15m':'1d', mode==='positional'||mode==='longterm', mode!=='intraday',deadline,undefined,{
         withBtstConfirmation: mode === 'btst',
-        sessionInstruments: mode === 'intraday' ? instrumentsPromise : undefined
+        sessionInstruments: instrumentsPromise
       }),
       beforeDeadline(getMarketRegime,deadline),
       instrumentsPromise,
       usesSectorBenchmark(mode)?beforeDeadline(getSectorBenchmarks, Date.now()+5200).catch(()=>[]):[],
-      beforeDeadline(getNseEvents, Date.now()+4500).catch(()=>new Map()),
-      beforeDeadline(getNseSurveillance, Date.now()+4500).catch(()=>new Map()),
+      beforeDeadline(getNseEventReports, Date.now()+4500).catch(()=>undefined),
+      beforeDeadline(getNseSurveillanceReports, Date.now()+4500).catch(()=>undefined),
       beforeDeadline(getNsePriceBands, Date.now()+4500).catch(()=>new Map())
     ]);
     const item = data.get(symbol);

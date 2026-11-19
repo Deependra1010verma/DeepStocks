@@ -7,6 +7,7 @@ export interface ISignalLedger extends Document {
   strategyVersion?: string;
   decisionAt?: Date;
   quoteAt?: Date;
+  casEligibleAtSignal?: boolean;
   entryLow: number;
   entryHigh: number;
   createdAt: Date;
@@ -42,6 +43,7 @@ export interface ISignalLedger extends Document {
 const SignalLedgerSchema = new Schema<ISignalLedger>({
   evaluationVersion: Number,
   strategyVersion: String, decisionAt: Date, quoteAt: Date,
+  casEligibleAtSignal: Boolean,
   entryLow: Number, entryHigh: Number, createdAt: Date, entryExpiresAt: Date, expiresAt: Date,
   filledAt: Date, closedAt: Date, checkedThrough: Date, target1At: Date, target1Price: Number, realizedR: Number,
   exitPrice: Number, outcomeReason: String, costBps: Number, slippageBps: Number,
